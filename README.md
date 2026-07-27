@@ -4,6 +4,17 @@ Extracting human motion data from scenes
 DispositionNext (DNX): a VideoMAEv2-backboned video → funscript motion model.
 This repo is a legacy-free extraction of the DNX system from `motionhelp` (YOLO/pose, optical flow, the DispositionTCN baseline).
 
+Uploaded three documents here since code isn't ready and neither are models (whole lotta labelling).
+- [model_description_simple](model_description_simple.md)
+- [model_description_intermediate](model_description_intermediate.md)
+- [model_description_technical](model_description_technical.md)
+
+Q. Well what good is that to me? I want code! 
+
+A. Since that's not ready (I have a day job), you could technically give your favoured coding assistant the motionhelp repo 
+and these documents and ask them to convert to the new architecture, and it'd likely output a working codebase to build your own dataset and train your own version.
+
+
 ## What's here
 
 - `src/models/` — `DispositionNext` head, vendored VideoMAEv2 ViT backbone.
