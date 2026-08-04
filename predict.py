@@ -69,15 +69,15 @@ def main() -> None:
                         help="Output funscript path (default: <video>.funscript)")
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--vr", dest="vr", action="store_true", default=False,
+    parser.add_argument("--vr", dest="vr", action="store_true", default=True,
                         help="VR / SBS video -- crop a single eye before decode")
     parser.add_argument("--no-vr", dest="vr", action="store_false")
     parser.add_argument("--sbs-crop", type=str, default="left", choices=["left", "right"],
                         help="Which SBS half (eye) to use when --vr is set")
-    parser.add_argument("--frame-view", type=str, default="auto", choices=list(FRAME_VIEWS),
+    parser.add_argument("--frame-view", type=str, default="crop", choices=list(FRAME_VIEWS),
                         help="Spatial framing fed to the backbone: 'crop' is the centre-bottom "
                              "crop, 'full' the whole eye. 'auto' follows the checkpoint's "
-                             "data_config['frame_mode']")
+                             "data_config['frame_mode']") # maybe one day custom crops.
 
     parser.add_argument("--start-time", type=float, default=0.0,
                         help="Start time in seconds")

@@ -1,11 +1,28 @@
 # motion_from_mae — inference
 
-Video → funscript with a trained DispositionNext head. CUDA only (torchcodec GPU decode).
+Video → funscript for scripters with a trained DispositionNext head.
 
 ```
-python predict.py --video video.mp4 --out video.funscript --vr --frame-view crop \
-    --start-time 1106.3 --duration 200
+python predict.py --video video.mp4 --out video.funscript --frame-view crop
 ```
+
+- Currently licensed as Creative Commons Attribution-NonCommercial 4.0 International, because that's what videomaev2 is so aligning keeps it simple. May change in the future if an alternate backbbone is utilized.
+- CUDA only (torchcodec GPU decode), it's a solvable problem but for now that's what it is.
+- VR trained, not normal flat scenes.
+- Intended for jumpstarting a script.
+    - It's consistently frame perfect on the usual positions and acts. It can take the monotony out of that 60 second, 2 stroke per second sequence and instead give the scripter ample time to put into that hand+hand+other sequence that's more nuanced.
+    - Outputs native fps funscripts (a lot of keypoints). To really make more normal funscripts, a good simplification algorithm probably needs to be added to the mix, but I'm not decided on it yet.
+    - It's not trained on any community or other scripts. Current dataset is only 359 x 20 second (1200 interpolated values + frames each) sequences for train, and 40 for validation. As that expands, performance would be expected to improve.
+    - During transitions the output is questionable. Sometimes it makes sense, sometimes it's garbage. It's likely a solvable problem but the intent is to assist human scripters, not replace.
+- My speed test results
+    - with preprocessing 
+        - ~3gb VRAM usage during ffmpeg video preprocessing. 25gb 8k @ 120fps ~ 21 minutes for 55minute video.
+        - 1.5gb VRAM during token extraction. ~2 mins.
+        - ~1gb VRAM during funscript prediction. ~20 seconds.
+        - Total time ~25 minutes.
+    - Without preprocessing, 25gb 8k @ 120fps ~ 23 minutes for 55minute video.
+        - Faster, still has reusable token cache for video, but no reusable video file.
+
 
 `--checkpoint` defaults to `herpaderpapotato/motion_from_mae`; the head records the
 backbone it needs (`herpaderpapotato/motion_from_mae_extract`) and both are pulled into
@@ -22,7 +39,7 @@ clip decodes at ~2000 frame/s, so re-runs over a window are ~5x faster. Needs a
 in-process one, so predictions shift slightly (position correlation ~0.99) and the two
 paths keep separate token caches.
 
-TLDR, preprocess with ffmpeg can crunch a 1 hour 24GB 60fps 8k SBS VR video into ~3.6GB 224x224 cropped (or not) left eye view in about 23 minutes, which can then be used to generate a funscript in 2 minutes and reused in the future if the videomae or head model is updated. There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
+There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
 
 Output never overwrites: if `video.funscript` exists the run writes
 `video.001.funscript`, then `.002`, and so on.
