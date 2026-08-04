@@ -18,7 +18,7 @@ On a 6gb 40 minute 5k scene with a 5090, this processed at 310 frames per second
 
 - Currently licensed as Creative Commons Attribution-NonCommercial 4.0 International, because that's what videomaev2 is so aligning keeps it simple. May change in the future if an alternate backbbone is utilized.
 - CUDA only (torchcodec GPU decode), it's a solvable problem but for now that's what it is.
-- VR trained, not normal flat scenes.
+- VR scene trained not normal flat scenes.
 - Intended for jumpstarting a script.
     - It's consistently frame perfect on the usual positions and acts. It can take the monotony out of that 60 second, 2 stroke per second sequence and instead give the scripter ample time to put into that hand+hand+other sequence that's more nuanced.
     - Outputs native fps funscripts (a lot of keypoints). To really make more normal funscripts, a good simplification algorithm probably needs to be added to the mix, but I'm not decided on it yet.
@@ -41,13 +41,11 @@ the HF cache on first use. It also accepts a local `.safetensors` export or a tr
 Tokens are cached under `data/video_token_cache/` (`--no-token-cache` to disable,
 `--token-cache-dir` to move); a re-run or an interrupted run resumes from there.
 
-`--preprocess` bakes the eye crop, the frame-view crop and the resize into a cached
+`--preprocess` makes a cached
 224x224 clip with ffmpeg + NVDEC (`data/video_preprocess_cache/`, `--preprocess-dir`
-to move). Decoding an 8K source is the throughput ceiling (~130 frame/s); the cached
-clip decodes at ~2000 frame/s, so re-runs over a window are ~5x faster. Needs a
-`*_cuvid` decoder for the source codec. ffmpeg's resize is not bit-identical with the
-in-process one, so predictions shift slightly (position correlation ~0.99) and the two
-paths keep separate token caches.
+to move). Decoding an 8K source is ~130 frame/s, the cached
+clip decodes at ~2000 frame/s. i.e. re-runs over a window are ~5x faster. Needs a
+`*_cuvid` decoder for the source codec. ffmpeg's resize isnt identical to the non-preprocessed one, so predictions can duffer slightly (position correlation ~0.99). Training data was all ffmpeg resized so maybe it'd be better, or maybe not. Too soon to say.
 
 There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
 
@@ -67,3 +65,10 @@ Resulting funscripts should only be used to facilitate funscript creation. Any a
 | `src/infer.py` | sliding-window blend, hold gate, smoothing |
 | `src/postprocess.py` | `--postprocess` wave normalisation |
 | `src/checkpoint.py`, `src/token_cache.py`, `src/funscript.py` | loading, caching, output |
+
+
+Also I used ai to help write the code and documentation (duh), because it's a lot...
+
+It's been a problem I've been coming going back to since 2023. It aint perfect, and my knowledge is still catching up in many areas (compare the loss functions I had in silver-lamp to the ones in this!).
+
+I look at this iteration as significant, and that it does something unique, despite the unusal nature the task. Any minute now Cunningham's Law will kick in and someone that knows what they're actually doing will step in!
