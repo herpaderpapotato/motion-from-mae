@@ -1,75 +1,42 @@
-# motion-from-mae
-Extracting human motion data from scenes
+# motion_from_mae — inference
 
-DispositionNext (DNX): a VideoMAEv2-backboned video → funscript motion model.
-This repo is a legacy-free extraction of the DNX system from `motionhelp` (YOLO/pose, optical flow, the DispositionTCN baseline).
+Video → funscript with a trained DispositionNext head. CUDA only (torchcodec GPU decode).
 
-Uploaded three documents here since code isn't ready and neither are models (whole lotta labelling).
-- [model_description_simple](model_description_simple.md)
-- [model_description_intermediate](model_description_intermediate.md)
-- [model_description_technical](model_description_technical.md)
-
-Q. Well what good is that to me? I want code! 
-
-A. Since that's not ready (I have a day job), you could technically give your favoured coding assistant the motionhelp repo 
-and these documents and ask them to convert to the new architecture, and it'd likely output a working codebase to build your own dataset and train your own version.
-
-
-## What's here
-
-- `src/models/` — `DispositionNext` head, vendored VideoMAEv2 ViT backbone.
-- `src/data/` — token extraction/caching, on-the-fly video dataset, funscript
-  I/O, wave postprocess, scene curation.
-- `src/training/` — DNX losses, timing/amplitude/hold metrics.
-- `scripts/` — extraction, training (Phase 1 frozen-head and Phase 2a/2b LoRA),
-  evaluation, prediction CLI + tkinter job-queue GUI, dataset prep.
-
-## Setup
-
-`conda-win-64.lock.txt` is an **explicit** lockfile (exact package URLs, no
-solving) capturing the source env's win-64 / CUDA 12.9 conda-forge build of
-the torch stack (`pytorch`/`torchvision`/`torchaudio`/`torchcodec`, all
-`cuda128_*`/`cuda129_*` builds, not `cpu_*`). A plain version-pinned
-`environment.yml` was tried first and doesn't work: an unpinned solve on this
-same channel config silently resolves to the CPU builds, and pinning the
-source env's exact build strings for a *fresh* solve hits an unsatisfiable
-`pybind11-abi` conflict (conda-forge/defaults repodata has been patched since
-that env was built). The explicit lockfile sidesteps solving entirely, so
-that drift can't bite here — but it does mean this only reproduces on win-64
-with a CUDA 12.9-capable driver; there's no cross-platform equivalent.
-
-```bat
-conda create -p .conda --file conda-win-64.lock.txt
-conda activate .\.conda
-pip install -r requirements-pip.txt
+```
+python predict.py --video video.mp4 --out video.funscript --vr --frame-view crop \
+    --start-time 1106.3 --duration 200
 ```
 
-Copy `.env.sample` to `.env` and fill in the xbvr database URL if using
-`prepare_videos.py` / the predict-job GUI's scene browser.
+`--checkpoint` defaults to `herpaderpapotato/motion_from_mae`; the head records the
+backbone it needs (`herpaderpapotato/motion_from_mae_extract`) and both are pulled into
+the HF cache on first use. It also accepts a local `.safetensors` export or a training `.pt`.
 
-## Quickstart
+Tokens are cached under `data/video_token_cache/` (`--no-token-cache` to disable,
+`--token-cache-dir` to move); a re-run or an interrupted run resumes from there.
 
-```bat
-:: extract VideoMAEv2 tokens for labelled scenes
-python scripts\extract_videomae.py --backbone data\models\backbones\VideoMAEv2-Base --slug videomaev2-b --device cuda:0
+`--preprocess` bakes the eye crop, the frame-view crop and the resize into a cached
+224x224 clip with ffmpeg + NVDEC (`data/video_preprocess_cache/`, `--preprocess-dir`
+to move). Decoding an 8K source is the throughput ceiling (~130 frame/s); the cached
+clip decodes at ~2000 frame/s, so re-runs over a window are ~5x faster. Needs a
+`*_cuvid` decoder for the source codec. ffmpeg's resize is not bit-identical with the
+in-process one, so predictions shift slightly (position correlation ~0.99) and the two
+paths keep separate token caches.
 
-:: train the DNX head on frozen tokens (see configs/dnx_head.sample.yaml -- a
-:: config file declares the slug/frame-mode/run-name set once; flags still win)
-python scripts\train_disposition_next.py --config configs\dnx_head.yaml
-python scripts\train_disposition_next.py --backbone-slug videomaev2-b --run-name my_run
+TLDR, preprocess with ffmpeg can crunch a 1 hour 24GB 60fps 8k SBS VR video into ~3.6GB 224x224 cropped (or not) left eye view in about 23 minutes, which can then be used to generate a funscript in 2 minutes and reused in the future if the videomae or head model is updated. There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
 
-:: continue a head run that was still improving (pass a larger --epochs)
-python scripts\train_disposition_next.py --config configs\dnx_head.yaml ^
-    --resume-from data\models\checkpoints_dnx\<run>\dnx_epoch1000.pt --epochs 2000
+Output never overwrites: if `video.funscript` exists the run writes
+`video.001.funscript`, then `.002`, and so on.
 
-:: predict a funscript from a video
-python scripts\predict_disposition.py --video path\to\video.mp4 --vr --sbs-crop left ^
-    --checkpoint data\models\checkpoints_dnx\<run>\best_disposition_next.pt
+Resulting funscripts should only be used to facilitate funscript creation. Any attempts to use the direct outputs is both unsupported and potentially a safety risk.
 
-:: evaluate against the timing benchmark
-python scripts\evaluate_timing.py --benchmark data\benchmarks\timing_v2.json ^
-    --checkpoint data\models\checkpoints_dnx\<run>\best_disposition_next.pt --run-name eval
-```
-
-`data/processed/`, `data/preprocessed/`, and `data/splits/` start empty — this
-repo builds a fresh self-labelled dataset.
+| module | what |
+|---|---|
+| `predict.py` | CLI |
+| `src/extract.py` | decode → eye crop → backbone tokens |
+| `src/backbone.py` | geometry, frame preprocessing, pooling |
+| `src/preprocess.py` | `--preprocess` ffmpeg/NVDEC crop+resize cache |
+| `src/videomaev2_backbone.py` | the VideoMAEv2 ViT |
+| `src/disposition_next.py`, `src/hlgauss.py` | the head |
+| `src/infer.py` | sliding-window blend, hold gate, smoothing |
+| `src/postprocess.py` | `--postprocess` wave normalisation |
+| `src/checkpoint.py`, `src/token_cache.py`, `src/funscript.py` | loading, caching, output |

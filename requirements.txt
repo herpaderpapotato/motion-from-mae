@@ -1,0 +1,8 @@
+torch
+torchcodec
+numpy
+scipy
+h5py
+tqdm
+safetensors
+huggingface_hub
