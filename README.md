@@ -6,6 +6,16 @@ Video → funscript for scripters with a trained DispositionNext head.
 python predict.py --video video.mp4 --out video.funscript --frame-view crop
 ```
 
+On a 6gb 40 minute 5k scene with a 5090, this processed at 310 frames per second. ~7 minute script generation in that scenario.
+
+
+## Install instructions
+1. install miniconda or a full anaconda installer
+2. Follow [WINDOWS.MD](WINDOWS.MD) or [LINUX.MD](LINUX.MD) (wsl)
+
+
+## Comments
+
 - Currently licensed as Creative Commons Attribution-NonCommercial 4.0 International, because that's what videomaev2 is so aligning keeps it simple. May change in the future if an alternate backbbone is utilized.
 - CUDA only (torchcodec GPU decode), it's a solvable problem but for now that's what it is.
 - VR trained, not normal flat scenes.
@@ -14,7 +24,7 @@ python predict.py --video video.mp4 --out video.funscript --frame-view crop
     - Outputs native fps funscripts (a lot of keypoints). To really make more normal funscripts, a good simplification algorithm probably needs to be added to the mix, but I'm not decided on it yet.
     - It's not trained on any community or other scripts. Current dataset is only 359 x 20 second (1200 interpolated values + frames each) sequences for train, and 40 for validation. As that expands, performance would be expected to improve.
     - During transitions the output is questionable. Sometimes it makes sense, sometimes it's garbage. It's likely a solvable problem but the intent is to assist human scripters, not replace.
-- My speed test results
+- My speed test results with a 4090
     - with preprocessing 
         - ~3gb VRAM usage during ffmpeg video preprocessing. 25gb 8k @ 120fps ~ 21 minutes for 55minute video.
         - 1.5gb VRAM during token extraction. ~2 mins.

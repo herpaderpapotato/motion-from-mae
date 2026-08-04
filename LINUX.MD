@@ -1,5 +1,11 @@
 # Linux setup (conda)
 
+## Warning
+
+This particularly MD file was AI written based off of installing + testing in WSL. Your mileage may vary but I wanted to have something as a starting point.
+
+## Guide
+
 Verified on Ubuntu 24.04 (WSL2), NVIDIA driver 591.44 / CUDA 13.1, RTX 4090,
 conda 25.5.1, Python 3.12.
 
