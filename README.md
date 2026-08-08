@@ -3,7 +3,17 @@
 Video → funscript for scripters with a trained DispositionNext head.
 
 ```
+# default backbone
 python predict.py --video video.mp4 --out video.funscript --frame-view crop
+
+# videomae2.1 224x224 backbone
+python predict.py --video video.mp4 --out video.funscript --frame-view crop --checkpoint herpaderpapotato/motion_from_mae
+
+# v-jepa2.1 384x384 backbone, slower/larger, still in testing 
+python predict.py --video video.mp4 --out video.funscript --frame-view crop --checkpoint herpaderpapotato/motion_from_mae_alt
+
+# command guidance
+python predict.py --help
 ```
 
 On a 6gb 40 minute 5k scene with a 5090, this processed at 310 frames per second. ~7 minute script generation in that scenario.
@@ -16,7 +26,7 @@ On a 6gb 40 minute 5k scene with a 5090, this processed at 310 frames per second
 
 ## Comments
 
-- Currently licensed as Creative Commons Attribution-NonCommercial 4.0 International, because that's what videomaev2 is so aligning keeps it simple. May change in the future if an alternate backbbone is utilized.
+- Currently licensed as Creative Commons Attribution-NonCommercial 4.0 International, because that's what videomaev2 is so aligning keeps it simple. May change in the future if an alternate backbbone is adopted as primary.
 - CUDA only (torchcodec GPU decode), it's a solvable problem but for now that's what it is.
 - VR scene trained not normal flat scenes.
 - Intended for jumpstarting a script.
@@ -67,7 +77,7 @@ Resulting funscripts should only be used to facilitate funscript creation. Any a
 | `src/checkpoint.py`, `src/token_cache.py`, `src/funscript.py` | loading, caching, output |
 
 
-Also I used ai to help write the code and documentation (duh), because it's a lot...
+Also I used ai to help write the code and documentation (duh), because it's a lot of iteration and testing...
 
 It's been a problem I've been coming going back to since 2023. It aint perfect, and my knowledge is still catching up in many areas (compare the loss functions I had in silver-lamp to the ones in this!).
 

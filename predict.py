@@ -57,7 +57,6 @@ def non_colliding_path(path: Path, max_tries: int = 1000) -> Path:
 
 
 def main() -> None:
-    os.makedirs("data",exist_ok=True)
     parser = argparse.ArgumentParser(
         description="Predict disposition with DispositionNext (DNX)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -69,7 +68,7 @@ def main() -> None:
                         help="Output funscript path (default: <video>.funscript)")
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--vr", dest="vr", action="store_true", default=True,
+    parser.add_argument("--vr", dest="vr", action="store_true", default=False,
                         help="VR / SBS video -- crop a single eye before decode")
     parser.add_argument("--no-vr", dest="vr", action="store_false")
     parser.add_argument("--sbs-crop", type=str, default="left", choices=["left", "right"],
@@ -77,7 +76,7 @@ def main() -> None:
     parser.add_argument("--frame-view", type=str, default="crop", choices=list(FRAME_VIEWS),
                         help="Spatial framing fed to the backbone: 'crop' is the centre-bottom "
                              "crop, 'full' the whole eye. 'auto' follows the checkpoint's "
-                             "data_config['frame_mode']") # maybe one day custom crops.
+                             "data_config['frame_mode']")
 
     parser.add_argument("--start-time", type=float, default=0.0,
                         help="Start time in seconds")
@@ -145,6 +144,7 @@ def main() -> None:
         use_cache=args.token_cache, cache_dir=args.token_cache_dir,
         show_progress=not args.no_progress, crop_box=crop_box, pooling=pooling,
         preprocess=args.preprocess, preprocess_dir=args.preprocess_dir,
+        backbone_img_size=data_cfg.get("backbone_img_size"),
     )
     feature_fps = float(meta["feature_fps"])
     print(f"DNX tokens: {tokens.shape}, feature_fps={feature_fps:.3f}, pooling={pooling}, "

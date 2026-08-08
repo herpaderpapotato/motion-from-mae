@@ -138,11 +138,17 @@ def extract_video_tokens(
     pooling: str | None = None,
     preprocess: bool = False,
     preprocess_dir: Path | None = None,
+    backbone_img_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Returns (tokens [S, P, D] float16, frame_idx [T] int32 relative to
-    start_time, metadata)."""
+    start_time, metadata).
+
+    `backbone_img_size` comes from the head's `data_config` and applies to
+    V-JEPA 2.1 only: it runs at any resolution (RoPE), so rebuilding it at the
+    release default when the head was trained on another one would silently feed
+    the head different features."""
     if model is None:
-        model, geometry = load_backbone(backbone_id, device=device)
+        model, geometry = load_backbone(backbone_id, device=device, img_size=backbone_img_size)
 
     fps_src, total_frames = decoder_timebase(video_path)
 

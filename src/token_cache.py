@@ -39,13 +39,19 @@ def _fingerprint_video_file(video_path: Path) -> str:
 
 def _fingerprint_backbone(geometry: Any) -> str:
     """Identity for the backbone that produced (or will produce) the tokens.
-    HF hub checkpoints have a real revision hash already (see
-    `load_backbone`); local merged backbones (Phase 2a/2b LoRA-merged
-    artifacts) don't, so fall back to the weight file's size+mtime."""
+    HF hub checkpoints have a real revision hash already (see `load_backbone`);
+    local merged backbones (Phase 2a/2b LoRA-merged artifacts) don't, so fall
+    back to the weight file's size+mtime.
+
+    Both local layouts are handled: a VideoMAEv2 checkpoint DIR holding
+    model.safetensors, and a V-JEPA 2.1 `.pt` where backbone_id IS the weight
+    file. Without the second case a re-merge written to the same path keeps the
+    old fingerprint, and the cache serves tokens from the previous weights."""
     if geometry.backbone_revision:
         raw = f"{geometry.backbone_id}|{geometry.backbone_revision}"
     else:
-        weight_file = Path(geometry.backbone_id) / "model.safetensors"
+        source = Path(geometry.backbone_id)
+        weight_file = source if source.is_file() else source / "model.safetensors"
         if weight_file.exists():
             wstat = weight_file.stat()
             raw = f"{geometry.backbone_id}|{wstat.st_size}|{int(wstat.st_mtime)}"

@@ -1,8 +1,15 @@
-"""Frozen VideoMAEv2 backbone: geometry, frame preprocessing, pooled slot tokens.
+"""Frozen backbone: geometry, frame preprocessing, pooled slot tokens.
 
 Inference subset of the training repo's src/data/videomae_features.py, cut to the
-one backbone family this repo runs. Numerics (crop box, resize, normalisation,
+backbone families this repo runs. Numerics (crop box, resize, normalisation,
 pooling, window padding, bf16 autocast) are unchanged from it.
+
+Two families, both vendored plain nn.Modules exposing `forward_tokens`:
+    - videomaev2  (checkpoint DIR or HF repo, 16-frame windows @224, D=768)
+    - vjepa21     (single `.pt`, 64-frame windows @384, D=768, RoPE)
+
+Both emit patch tokens ordered (temporal, height, width) row-major, so the
+[B, S, Hg, Wg, D] reshape in `clip_tokens_from_frames` holds for either.
 """
 
 from __future__ import annotations
@@ -95,23 +102,81 @@ def _run_backbone(model: Any, geometry: BackboneGeometry, pixel_values: torch.Te
     return model.forward_tokens(pixel_values.permute(0, 2, 1, 3, 4))
 
 
-def load_backbone(
-    checkpoint_id: str, device: str | torch.device = "cuda", slug_override: str | None = None,
-) -> tuple[Any, BackboneGeometry]:
-    """Load the frozen VideoMAEv2 ViT from a local dir or an HF repo id.
+def _resolve_backbone_source(checkpoint_id: str) -> tuple[Path, str | None]:
+    """Local path as-is, or an HF repo snapshot. Returns (path, revision);
+    revision is the hub commit sha, None for a local path."""
+    path = Path(checkpoint_id)
+    if path.exists():
+        return path, None
 
-    All geometry comes from the checkpoint's own config.json /
-    preprocessor_config.json, then the token-grid reshape is asserted once.
+    from huggingface_hub import snapshot_download
+
+    local_dir = Path(snapshot_download(str(checkpoint_id)))
+    # .../snapshots/<sha>/ -- the sha is the backbone identity the token cache keys on.
+    revision = local_dir.name if local_dir.parent.name == "snapshots" else None
+    return local_dir, revision
+
+
+def _detect_family(source: Path, checkpoint_id: str) -> str:
+    """Which family a resolved checkpoint is, from its CONTENTS.
+
+    Never from its name: a repo is free to be called anything, and inferring
+    the family from the id is how `motion_from_mae_altextract` -- a perfectly
+    reasonable name for a repo holding a V-JEPA 2.1 .pt -- got sent to the
+    VideoMAEv2 loader.
     """
-    from src.videomaev2_backbone import (
-        build_videomaev2_vit,
-        load_videomaev2_weights,
-        resolve_videomaev2_source,
+    from src.videomaev2_backbone import is_videomaev2_dir
+
+    if source.is_file():
+        if source.suffix.lower() in (".pt", ".pth"):
+            return "vjepa21"
+        raise SystemExit(f"{checkpoint_id}: expected a checkpoint directory or a .pt/.pth file")
+    if is_videomaev2_dir(source):
+        return "videomaev2"
+    if any(p.suffix.lower() in (".pt", ".pth") for p in source.iterdir()):
+        return "vjepa21"
+    raise SystemExit(
+        f"{checkpoint_id} is neither a VideoMAEv2 checkpoint (config.json + preprocessor_config.json) "
+        "nor a V-JEPA 2.1 checkpoint (a .pt/.pth weight file)"
     )
 
-    device = torch.device(device)
-    source_dir, revision = resolve_videomaev2_source(checkpoint_id)
 
+def load_backbone(
+    checkpoint_id: str, device: str | torch.device = "cuda", slug_override: str | None = None,
+    img_size: int | None = None,
+) -> tuple[Any, BackboneGeometry]:
+    """Load the frozen backbone from a local path or an HF repo id.
+
+    The family is detected from the resolved checkpoint's contents, so a head
+    can name its backbone whatever it likes. All geometry comes from the
+    checkpoint itself -- config.json / preprocessor_config.json for VideoMAEv2,
+    the weight shapes for V-JEPA 2.1 -- then the token-grid reshape is asserted
+    once.
+
+    `img_size` overrides the backbone input resolution and applies only to
+    V-JEPA 2.1: RoPE takes positions from the input grid, so it runs at any
+    resolution and nothing in the weights records which one was used. Callers
+    pass the head's `data_config['backbone_img_size']`; without it a head
+    trained on 384 tokens would silently be served the release default.
+    VideoMAEv2's learned position embedding pins its own resolution, so passing
+    it there is an error rather than a resize.
+    """
+    device = torch.device(device)
+    source, revision = _resolve_backbone_source(str(checkpoint_id))
+    family = _detect_family(source, str(checkpoint_id))
+    if family == "vjepa21":
+        return _load_vjepa21_backbone(
+            str(checkpoint_id), source, revision, device, slug_override, img_size,
+        )
+    if img_size is not None:
+        raise ValueError(
+            f"img_size={img_size} was given for {checkpoint_id}, which is a VideoMAEv2 backbone; "
+            "only V-JEPA 2.1 (RoPE) runs at a resolution other than the one it was trained at."
+        )
+
+    from src.videomaev2_backbone import build_videomaev2_vit, load_videomaev2_weights
+
+    source_dir = source
     model, mc = build_videomaev2_vit(source_dir)
     load_videomaev2_weights(model, source_dir)
     model.eval().to(device)
@@ -145,6 +210,67 @@ def load_backbone(
         norm_mean=tuple(float(x) for x in pp["image_mean"]),
         norm_std=tuple(float(x) for x in pp["image_std"]),
         slug=slug_override or f"videomaev2-{size_code}",
+    )
+    _assert_token_grid(model, geometry, device)
+    return model, geometry
+
+
+# Frames per backbone window for V-JEPA 2.1: the clip length the 2.1 cooldown
+# configs train at. RoPE means the encoder is not pinned to it, but the token
+# cadence is, so it must not drift from what extraction used.
+VJEPA21_WINDOW_FRAMES = 64
+
+
+def _load_vjepa21_backbone(
+    checkpoint_id: str, source: Path, revision: str | None, device: torch.device,
+    slug_override: str | None, img_size: int | None,
+) -> tuple[Any, BackboneGeometry]:
+    """Load the vendored V-JEPA 2.1 ViT (frozen) + geometry from a release or
+    LoRA-merged `.pt`. Normalisation is ImageNet, the reference default."""
+    from src.vjepa21_backbone import (
+        VJEPA21_NORM_MEAN,
+        VJEPA21_NORM_STD,
+        find_vjepa21_checkpoint,
+        load_vjepa21_vit,
+    )
+
+    source_path = find_vjepa21_checkpoint(source)
+    model, mc = load_vjepa21_vit(source_path, img_size=img_size)
+    model.eval().to(device)
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    crop = (mc["img_size"], mc["img_size"])
+    patch = mc["patch_size"]
+    size_code = {768: "b", 1024: "l", 1280: "h", 1408: "g"}.get(mc["embed_dim"], str(mc["embed_dim"]))
+    slug = f"vjepa21-{size_code}-{crop[0]}"
+    if mc.get("derived"):
+        # A LoRA-merged backbone has the SAME geometry as the release it came
+        # from, so the geometry-derived slug would name its token cache
+        # identically. Name it after where it came from instead -- the repo id
+        # for a hub checkpoint (the snapshot dir is a bare sha), the containing
+        # directory for a local merge.
+        if revision is not None:
+            tag = str(checkpoint_id).rstrip("/").split("/")[-1]
+        elif source_path.stem.startswith("vjepa21_merged"):
+            tag = source_path.parent.name
+        else:
+            tag = source_path.stem
+        slug = "".join(c if (c.isalnum() or c in "-_+.") else "_" for c in tag)[:60] or f"{slug}-derived"
+
+    geometry = BackboneGeometry(
+        backbone_id=str(checkpoint_id),
+        backbone_revision=revision,
+        family="vjepa21",
+        hidden_dim=mc["embed_dim"],
+        tubelet_size=mc["tubelet_size"],
+        patch_size=patch,
+        window=VJEPA21_WINDOW_FRAMES,
+        spatial_grid=(crop[0] // patch, crop[1] // patch),
+        resize=crop,
+        norm_mean=VJEPA21_NORM_MEAN,
+        norm_std=VJEPA21_NORM_STD,
+        slug=slug_override or slug,
     )
     _assert_token_grid(model, geometry, device)
     return model, geometry
