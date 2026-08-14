@@ -8,7 +8,7 @@ the same window decode at thousands of frame/s instead.
 The resize uses scale_cuda's plain bilinear because that is what
 `crop_resize_normalize` does: NVDEC's own `-resize` applies a wide antialiasing
 filter, which shifts pooled tokens well off the in-process path (token
-correlation 0.88 vs 0.99 for bilinear).
+correlation 0.88 vs 0.99 for bilinear). Maybe that's better, one day i'll test.
 """
 
 from __future__ import annotations
@@ -21,18 +21,17 @@ from pathlib import Path
 DEFAULT_PREPROCESS_DIR = Path("data/video_preprocess_cache")
 
 # Container codec name -> cuvid decoder. Only these can crop in NVDEC (`-crop`),
-# which is what keeps the 8K frame off the filter graph.
+# because speeeeeeed
 CUVID_DECODERS = {
     "h264": "h264_cuvid", "hevc": "hevc_cuvid", "vp8": "vp8_cuvid", "vp9": "vp9_cuvid",
     "av1": "av1_cuvid", "mpeg1video": "mpeg1_cuvid", "mpeg2video": "mpeg2_cuvid",
     "mpeg4": "mpeg4_cuvid", "vc1": "vc1_cuvid",
 }
 
-# Lossless so the cache is a pure decode shortcut, not a quality knob.
 ENCODERS = (
-    ["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "lossless"],
-    ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "lossless"],
-    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "0"],
+    ["-c:v", "hevc_nvenc", "-preset", "p7", "-rc", "constqp", "-qp", "16"],
+    ["-c:v", "h264_nvenc", "-preset", "p7", "-rc", "constqp", "-qp", "16"],
+    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14"],
 )
 
 _RANGE_RE = re.compile(r"_f(\d+)-(\d+)\.mp4$")
@@ -75,7 +74,10 @@ def source_crop_pixels(
     x1_px, x2_px = int(round(x1 * eye_w)), int(round(x2 * eye_w))
     y1_px = int(round(y1 * eye_h))
     y2_px = eye_h if y2 >= 1.0 else int(round(y2 * eye_h))
-    return eye_x0 + x1_px, y1_px, x2_px - x1_px, y2_px - y1_px
+    left, top = (eye_x0 + x1_px) & ~1, y1_px & ~1
+    w, h = (x2_px - x1_px) & ~1, (y2_px - y1_px) & ~1
+    return left, top, min(w, src_w - left), min(h, src_h - top)
+
 
 
 def _identity(
