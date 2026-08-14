@@ -119,6 +119,10 @@ def main() -> None:
                              "runs over the same window skip decoding the full-resolution source")
     parser.add_argument("--no-preprocess", dest="preprocess", action="store_false")
     parser.add_argument("--preprocess-dir", type=Path, default=DEFAULT_PREPROCESS_DIR)
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the backbone blocks. Costs ~25s of compile once, then "
+                             "measured 1.10x at 384 and 1.27x at 224 on a 3090. Needs triton "
+                             "(on Windows: pip install triton-windows)")
     parser.add_argument("--no-progress", action="store_true", help="Suppress the extraction progress bar")
 
     args = parser.parse_args()
@@ -128,6 +132,14 @@ def main() -> None:
         parser.error("CUDA is required (torchcodec GPU decode)")
     if not torch.cuda.is_available():
         parser.error("torch.cuda.is_available() is False")
+    if device.index is None:
+        # Resolve a bare "cuda" to an explicit index: torchcodec wants a concrete
+        # one. Then pin it as the current device -- torchcodec's CUDA decoder and
+        # torch.compile's inductor/triton kernels both bind to the CURRENT device,
+        # which stays cuda:0 unless set, so `--device cuda:1 --compile` otherwise
+        # fails with `CUDA error: invalid argument` on the decoded frames.
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.set_device(device)
     print(f"Using device: {device}")
 
     model, model_cfg, data_cfg = load_dnx_model(args.checkpoint, device, use_ema=not args.use_raw_weights)
@@ -145,6 +157,7 @@ def main() -> None:
         show_progress=not args.no_progress, crop_box=crop_box, pooling=pooling,
         preprocess=args.preprocess, preprocess_dir=args.preprocess_dir,
         backbone_img_size=data_cfg.get("backbone_img_size"),
+        compile_model=args.compile,
     )
     feature_fps = float(meta["feature_fps"])
     print(f"DNX tokens: {tokens.shape}, feature_fps={feature_fps:.3f}, pooling={pooling}, "

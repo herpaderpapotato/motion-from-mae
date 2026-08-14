@@ -20,6 +20,7 @@ from src.backbone import (
     DEFAULT_POOLING,
     FULL_FRAME_CROP_BOX,
     clip_tokens_from_frames,
+    compile_backbone,
     crop_resize_normalize,
     load_backbone,
     pooling_num_tokens,
@@ -139,6 +140,7 @@ def extract_video_tokens(
     preprocess: bool = False,
     preprocess_dir: Path | None = None,
     backbone_img_size: int | None = None,
+    compile_model: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Returns (tokens [S, P, D] float16, frame_idx [T] int32 relative to
     start_time, metadata).
@@ -149,6 +151,8 @@ def extract_video_tokens(
     the head different features."""
     if model is None:
         model, geometry = load_backbone(backbone_id, device=device, img_size=backbone_img_size)
+    if compile_model:
+        compile_backbone(model)
 
     fps_src, total_frames = decoder_timebase(video_path)
 

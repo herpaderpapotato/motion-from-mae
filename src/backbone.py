@@ -96,6 +96,21 @@ def _assert_token_grid(model: Any, geometry: BackboneGeometry, device: torch.dev
         )
 
 
+def compile_backbone(model: Any) -> None:
+    """torch.compile the transformer blocks in place (opt-in; needs triton).
+
+    Compiles the BLOCK LIST, not the model: both vendored ViTs are entered
+    through `forward_tokens`, and `torch.compile(model)` wraps `__call__`, so
+    compiling the model itself would be a silent no-op. Blocks are shape-stable
+    across windows, so this is one compile per resolution -- ~25 s once, then a
+    measured 1.10x at 384 and 1.27x at 224 on a 3090.
+    """
+    for i in range(len(model.blocks)):
+        if hasattr(model.blocks[i], "_orig_mod"):  # already compiled; don't stack wrappers
+            continue
+        model.blocks[i] = torch.compile(model.blocks[i])
+
+
 def _run_backbone(model: Any, geometry: BackboneGeometry, pixel_values: torch.Tensor) -> torch.Tensor:
     """[B, num_frames, 3, H, W] -> [B, num_patches, D]. The ViT's Conv3d tubelet
     embed wants channels first, hence the permute."""
