@@ -33,13 +33,16 @@ from src.funscript import predictions_to_funscript
 from src.hlgauss import HLGAUSS_MODE_RADIUS
 from src.infer import (
     CONF_GAP_CEIL,
-    CONF_SPREAD_CEIL,
-    CONF_SPREAD_FLOOR,
+    CONF_RESIDUAL_HALF_RANGE,
+    CONF_SMOOTH_FRAMES,
     CROP_SLOTS,
     DECODE_MODES,
     HOLD_GATE_ACTIVITY_THRESHOLD,
     HOLD_GATE_MIN_RUN_S,
+    STROKE_MIN_DISTANCE_S,
+    STROKE_PROMINENCE,
     apply_hold_gate,
+    confidence_axes,
     sliding_window_predict_dnx,
     smooth_positions,
 )
@@ -160,13 +163,13 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     t0 = time.perf_counter()
     crop_slots = args.dnx_crop_slots
     stride_slots = min(max(1, args.dnx_stride or max(1, crop_slots // 2)), crop_slots)
-    position, activity, confidence = sliding_window_predict_dnx(
+    position, activity, moments = sliding_window_predict_dnx(
         model, tokens, device, crop_slots=crop_slots, overlap=1.0 - (stride_slots / crop_slots),
         decode=args.decode, decode_radius=args.decode_radius,
     )
     position = position[:len(frame_idx)]
     activity = activity[:len(frame_idx)]
-    confidence = {k: v[:len(frame_idx)] for k, v in confidence.items()}
+    moments = {k: v[:len(frame_idx)] for k, v in moments.items()}
 
     if args.hold_gate:
         position = apply_hold_gate(
@@ -184,25 +187,36 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     if verbose:
         print(f"  head: {len(position)} frames in {time.perf_counter() - t0:.2f}s, "
               f"mean {position.mean():.3f}, std {position.std():.3f}")
-        print(f"  confidence: C1 spread {100 * confidence['spread'].mean():.0f}, "
-              f"C2 agreement {100 * confidence['agreement'].mean():.0f} (mean of 100)")
-
-    # Extra axes ride the main track's timestamps, so they must be built from
-    # the ungated, unsmoothed confidence -- those filters only touch position.
+    # Built from the FINAL position: C1 divides by its speed and C3 segments it
+    # into strokes, so both have to see the track that gets written.
     axes = None
     if args.confidence_axes:
+        conf = confidence_axes(position, moments, feature_fps)
+        if verbose:
+            print("  confidence (mean of 100): "
+                  + ", ".join(f"{k} {100 * v.mean():.0f}" for k, v in conf.items()))
         axes = {
-            "C1": {"values": confidence["spread"],
-                   "metadata": {"name": "confidence_spread",
-                                "description": "100 = bin distribution as sharp as the "
-                                               "HL-Gauss training sigma, 0 = too wide to place",
-                                "scale_floor": CONF_SPREAD_FLOOR, "scale_ceil": CONF_SPREAD_CEIL,
-                                "calibrated": False}},
-            "C2": {"values": confidence["agreement"],
+            "C1": {"values": conf["C1"],
+                   "metadata": {"name": "confidence_anomaly",
+                                "description": "Distribution spread with the stroke-speed trend "
+                                               "regressed out: 50 = as sharp as this video's "
+                                               "strokes usually are at this speed, 100 = much "
+                                               "sharper, 0 = much vaguer. Relative to the video",
+                                "residual_half_range": CONF_RESIDUAL_HALF_RANGE,
+                                "smooth_frames": CONF_SMOOTH_FRAMES, "calibrated": False}},
+            "C2": {"values": conf["C2"],
                    "metadata": {"name": "confidence_agreement",
                                 "description": "100 = expectation and mode decodes agree, "
                                                "0 = split between two positions",
-                                "scale_ceil": CONF_GAP_CEIL, "calibrated": False}},
+                                "scale_ceil": CONF_GAP_CEIL,
+                                "smooth_frames": CONF_SMOOTH_FRAMES, "calibrated": False}},
+            "C3": {"values": conf["C3"],
+                   "metadata": {"name": "confidence_per_stroke",
+                                "description": "min(median C1, median C2) held across each "
+                                               "stroke: which strokes to review, not which "
+                                               "frames",
+                                "prominence": STROKE_PROMINENCE,
+                                "min_distance_s": STROKE_MIN_DISTANCE_S, "calibrated": False}},
         }
 
     # Action times come from the source's own frame timestamps; a stream whose
@@ -292,8 +306,9 @@ def main() -> None:
                         help="Minimum sustained-low-activity duration in seconds")
     parser.add_argument("--save-activity", action="store_true", help="Write a sidecar .activity.npy")
     parser.add_argument("--confidence-axes", dest="confidence_axes", action="store_true", default=True,
-                        help="Write per-frame confidence as extra funscript axes C1 (distribution "
-                             "spread) and C2 (expectation-vs-mode agreement), 0-100 like pos, "
+                        help="Write confidence as extra funscript axes C1 (speed-corrected "
+                             "sharpness), C2 "
+                             "(decode agreement) and C3 (per-stroke aggregate), 0-100 like pos, "
                              "higher = more confident. Uncalibrated: a ranking, not an error bar")
     parser.add_argument("--no-confidence-axes", dest="confidence_axes", action="store_false",
                         help="Position track only (~1/3 the file size)")

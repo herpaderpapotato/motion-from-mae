@@ -50,22 +50,28 @@ genuinely CFR source the two are identical.
 Output never overwrites: if `video.funscript` exists the run writes
 `video.001.funscript`, then `.002`, and so on.
 
-Per-frame confidence is written as two extra funscript axes (version 1.1 `axes` list),
-on the same 0-100 integer scale as `pos`, **higher = more confident**:
+Confidence is written as three extra funscript axes (version 1.1 `axes` list), on the
+same 0-100 integer scale as `pos`, **higher = more confident**:
 
 | axis | signal | reads as |
 |---|---|---|
-| `C1` | std of the blended HL-Gauss bin distribution | how tightly the head localised the position |
-| `C2` | \|expectation - mode\| decode gap | whether it is split between two positions, or just vague |
+| `C1` | distribution spread, stroke-speed trend regressed out | 50 = as sharp as this video's strokes usually are at this speed; 0 = much vaguer |
+| `C2` | \|expectation - mode\| decode gap | whether the head is split between two positions, or just vague |
+| `C3` | min of C1/C2 medians, held across each stroke | which strokes to review |
 
-Both come free from the distribution the position is already decoded from. The 0-100
-mapping is display scaling, not calibration (`CONF_*` in `src/infer.py`): the C1 floor
-is the head's training sigma (0.02; measured p1 over 36k real frames was 0.021) and its
-ceiling is the std of a uniform distribution, i.e. no information. They rank frames
-within a video — they are **not** error bars, and they measure amplitude uncertainty,
-not timing: the training loss is a soft-min over ±5-frame shifts, so a sharp
-distribution can still sit a few frames off. `--no-confidence-axes` drops them and the
-file to ~1/3 the size.
+All three come free from the distribution the position is already decoded from. Raw
+spread is **not** usable on its own: it scales with stroke speed (measured corr +0.30
+against |velocity|), so it peaks at every turnaround. Dividing by speed makes it worse
+(+0.69, merely inverted) because spread behaves like `A + B*|v|`; regressing speed out
+and keeping the residual gets it to +0.05. That makes C1 relative to the video, while
+C2 keeps an absolute scale.
+
+The 0-100 mappings are display scaling, not calibration (`CONF_*` in `src/infer.py`,
+each constant measured over 36k frames of real content). They rank frames within a
+video — they are **not** error bars, and they measure amplitude uncertainty, not
+timing: the training loss is a soft-min over ±5-frame shifts, so a sharp distribution
+can still sit a few frames off. `--no-confidence-axes` drops them and the file to ~1/4
+the size.
 
 Resulting funscripts should only be used to facilitate funscript creation. Any attempts to use the direct outputs is both unsupported and potentially a safety risk.
 
