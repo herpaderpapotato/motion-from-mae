@@ -27,8 +27,9 @@ re-runs over a window are ~5x faster. Needs a `*_cuvid` decoder for the source c
 ffmpeg's resize is not bit-identical with the in-process one, so predictions shift
 slightly (position correlation ~0.99) and the two paths keep separate token caches.
 
-`--compile` torch.compiles the backbone blocks: ~25 s of compile on the first window,
-then a measured 1.10x at 384 and 1.27x at 224 on a 3090. Needs triton (`pip install
+`--compile` torch.compiles the backbone blocks: ~25 s of compile once at startup (the
+backbone is loaded and compiled once for the whole batch, not per video), then a
+measured 1.10x at 384 and 1.27x at 224 on a 3090. Needs triton (`pip install
 triton-windows` on Windows). Worth it on a long run, not on a short one.
 
 There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
@@ -50,3 +51,4 @@ Resulting funscripts should only be used to facilitate funscript creation. Any a
 | `src/infer.py` | sliding-window blend, hold gate, smoothing |
 | `src/postprocess.py` | `--postprocess` wave normalisation |
 | `src/checkpoint.py`, `src/token_cache.py`, `src/funscript.py` | loading, caching, output |
+| `src/progress.py` | timed step lines, quiet HF cache lookups |

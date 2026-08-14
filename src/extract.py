@@ -25,6 +25,7 @@ from src.backbone import (
     load_backbone,
     pooling_num_tokens,
 )
+from src.progress import step
 from src.token_cache import ResumableTokenCache, cache_path_for_video
 
 
@@ -50,7 +51,8 @@ def decoder_timebase(video_path: Path) -> tuple[float, int]:
         if candidate > 0:
             fps = candidate
     except Exception as exc:
-        print(f"[warn] could not read r_frame_rate for {video_path} ({exc}); "
+        # Leading newline: this can fire inside a `step` line still awaiting its result.
+        print(f"\n  [warn] no r_frame_rate for {Path(video_path).name} ({type(exc).__name__}); "
               f"falling back to the average frame rate, which drifts on long files")
 
     from torchcodec.decoders import VideoDecoder
@@ -150,11 +152,14 @@ def extract_video_tokens(
     release default when the head was trained on another one would silently feed
     the head different features."""
     if model is None:
-        model, geometry = load_backbone(backbone_id, device=device, img_size=backbone_img_size)
-    if compile_model:
-        compile_backbone(model)
+        with step(f"loading backbone {backbone_id}", show_progress):
+            model, geometry = load_backbone(backbone_id, device=device, img_size=backbone_img_size)
+        if compile_model:
+            compile_backbone(model)
 
-    fps_src, total_frames = decoder_timebase(video_path)
+    with step("reading source metadata", show_progress) as st:
+        fps_src, total_frames = decoder_timebase(video_path)
+        st.note(f"{total_frames} frames @ {fps_src:.3f} fps ({total_frames / max(fps_src, 1e-6) / 60:.1f} min)")
 
     start_frame = int(round((start_time or 0.0) * fps_src))
     end_frame = total_frames if duration is None else min(total_frames, start_frame + int(round(duration * fps_src)))
@@ -195,10 +200,14 @@ def extract_video_tokens(
             n_pool_tokens=pooling_num_tokens(pooling),
         )
         if resume_from_slot >= total_expected_slots > 0:
-            print(f"Video token cache hit (complete): {cache_path}")
-            return cache.read_all(), rel_indices.astype(np.int32), _make_metadata()
-        if resume_from_slot > 0:
-            print(f"Resuming video token cache from slot {resume_from_slot}/{total_expected_slots}: {cache_path}")
+            if show_progress:
+                print(f"  token cache hit: {cache_path.name}")
+            with step("reading cached tokens", show_progress):
+                tokens = cache.read_all()
+            return tokens, rel_indices.astype(np.int32), _make_metadata()
+        if resume_from_slot > 0 and show_progress:
+            print(f"  resuming token cache at slot {resume_from_slot}/{total_expected_slots} "
+                  f"({100 * resume_from_slot / total_expected_slots:.1f}%)")
 
     remaining_idx_list = idx_list[resume_from_slot * frames_per_slot:]
 
@@ -216,12 +225,16 @@ def extract_video_tokens(
                 start_frame, end_frame, fps_src, cache_dir=preprocess_dir,
                 quiet=not show_progress,
             )
-            decoder = PreprocessedDecoder(clip_path, device, first_frame)
+            with step("opening preprocessed clip", show_progress):
+                decoder = PreprocessedDecoder(clip_path, device, first_frame)
             decode_crop_box = FULL_FRAME_CROP_BOX
         except pp.PreprocessUnavailable as exc:
-            print(f"[warn] preprocess unavailable ({exc}); decoding the source directly")
+            print(f"  [warn] preprocess unavailable ({exc}); decoding the source directly")
     if decoder is None:
-        decoder = EyeDecoder(Path(video_path), device, vr_mode, sbs_crop)
+        # seek_mode="exact" indexes the container up front -- minutes on a 25 GB
+        # 8K source, and the longest unexplained pause in the whole run.
+        with step("indexing source frames (exact seek)", show_progress):
+            decoder = EyeDecoder(Path(video_path), device, vr_mode, sbs_crop)
     decode_chunk = max(1, decoder.decode_batch)
     if cache is not None:
         cache.open()
@@ -229,7 +242,7 @@ def extract_video_tokens(
     carry: torch.Tensor | None = None
     progress = tqdm(
         total=len(idx_list), initial=resume_from_slot * frames_per_slot, unit="frame",
-        desc="Extracting DNX tokens", disable=not show_progress,
+        desc="  extracting tokens", disable=not show_progress,
     )
     # Backbone windows are non-overlapping and self-contained, so splitting on
     # window boundaries and pooling each piece separately gives identical tokens
@@ -269,7 +282,8 @@ def extract_video_tokens(
 
     if cache is not None:
         cache.close()  # flush the buffered tail before reading back
-        tokens = cache.read_all()
+        with step("reading cached tokens", show_progress):
+            tokens = cache.read_all()
     else:
         tokens = (
             np.concatenate(pooled_chunks, axis=0) if pooled_chunks

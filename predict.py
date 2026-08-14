@@ -21,7 +21,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from src.backbone import FULL_FRAME_CROP_BOX
+from src.backbone import (
+    FULL_FRAME_CROP_BOX,
+    compile_backbone,
+    load_backbone,
+    warmup_backbone,
+)
 from src.checkpoint import DEFAULT_CHECKPOINT, load_dnx_model, resolve_pooling_for_head
 from src.extract import extract_video_tokens
 from src.funscript import predictions_to_funscript
@@ -36,6 +41,7 @@ from src.infer import (
     smooth_positions,
 )
 from src.preprocess import DEFAULT_PREPROCESS_DIR
+from src.progress import human_duration, step
 from src.token_cache import DEFAULT_CACHE_DIR
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -129,20 +135,24 @@ def pick_target() -> Path | None:
 # --------------------------------------------------------------------------- #
 
 def process(video: Path, out: Path | None, args: argparse.Namespace, model, data_cfg: dict,
-            device: torch.device, pooling, crop_box, frame_view: str) -> str:
+            device: torch.device, pooling, crop_box, frame_view: str,
+            backbone=None, geometry=None) -> str:
     """Predict one video and write its funscript. Returns a one-line status."""
+    verbose = not args.no_progress
     tokens, frame_idx, meta = extract_video_tokens(
         video, data_cfg["backbone_id"], device, args.vr, args.sbs_crop,
         args.start_time, args.duration,
+        model=backbone, geometry=geometry,
         use_cache=args.token_cache, cache_dir=args.token_cache_dir,
-        show_progress=not args.no_progress, crop_box=crop_box, pooling=pooling,
+        show_progress=verbose, crop_box=crop_box, pooling=pooling,
         preprocess=args.preprocess, preprocess_dir=args.preprocess_dir,
         backbone_img_size=data_cfg.get("backbone_img_size"),
-        compile_model=args.compile,
+        compile_model=args.compile and backbone is None,
     )
     feature_fps = float(meta["feature_fps"])
-    print(f"DNX tokens: {tokens.shape}, feature_fps={feature_fps:.3f}, pooling={pooling}, "
-          f"frame_view={frame_view}, decode={args.decode}")
+    if verbose:
+        print(f"  tokens: {tokens.shape[0]} slots x {tokens.shape[1]} x {tokens.shape[2]} "
+              f"@ {feature_fps:.3f} fps")
 
     t0 = time.perf_counter()
     crop_slots = args.dnx_crop_slots
@@ -164,10 +174,12 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     if args.dnx_smooth != "none":
         smooth_window = args.dnx_smooth_window or (3 if args.dnx_smooth == "median" else 5)
         position = smooth_positions(position, args.dnx_smooth, smooth_window, args.dnx_smooth_polyorder)
-        print(f"  smoothing: {args.dnx_smooth} w={smooth_window}")
+        if verbose:
+            print(f"  smoothing: {args.dnx_smooth} w={smooth_window}")
 
-    print(f"Prediction: {len(position)} frames in {time.perf_counter() - t0:.2f}s  "
-          f"mean={position.mean():.4f}  std={position.std():.4f}")
+    if verbose:
+        print(f"  head: {len(position)} frames in {time.perf_counter() - t0:.2f}s, "
+              f"mean {position.mean():.3f}, std {position.std():.3f}")
 
     out_path = non_colliding_path(out or video.with_suffix(".funscript"))
     funscript = predictions_to_funscript(
@@ -185,7 +197,7 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(funscript, fh)
-    status = f"Saved funscript -> {out_path}"
+    status = f"-> {out_path} ({len(funscript['actions'])} actions)"
 
     if args.save_activity:
         act_path = out_path.with_suffix(".activity.npy")
@@ -263,7 +275,8 @@ def main() -> None:
                         help="torch.compile the backbone blocks. Costs ~25s of compile once, then "
                              "measured 1.10x at 384 and 1.27x at 224 on a 3090. Needs triton "
                              "(on Windows: pip install triton-windows)")
-    parser.add_argument("--no-progress", action="store_true", help="Suppress the extraction progress bar")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Quiet: no progress bars or per-phase status lines, one line per video")
 
     args = parser.parse_args()
 
@@ -295,7 +308,7 @@ def main() -> None:
         # fails with `CUDA error: invalid argument` on the decoded frames.
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
-    print(f"Using device: {device}")
+    print(f"Device: {device} ({torch.cuda.get_device_name(device)})")
 
     model, model_cfg, data_cfg = load_dnx_model(args.checkpoint, device, use_ema=not args.use_raw_weights)
     frame_view = args.frame_view
@@ -305,21 +318,41 @@ def main() -> None:
     crop_box = FULL_FRAME_CROP_BOX if use_full_frame else None
     pooling = resolve_pooling_for_head(model)
 
-    print(f"{len(videos)} video(s) under {target}")
+    # Load the backbone ONCE for the whole batch. Extraction would otherwise
+    # resolve the hub repo, rebuild it and re-pay the torch.compile cost per
+    # video -- the repeated "Fetching N files" and the long silent start.
+    backbone_id = data_cfg["backbone_id"]
+    verbose = not args.no_progress
+    with step(f"Loading backbone {backbone_id}", verbose, indent="") as st:
+        backbone, geometry = load_backbone(
+            backbone_id, device=device, img_size=data_cfg.get("backbone_img_size"))
+        st.note(f"{geometry.slug}, {geometry.window}-frame windows @ {geometry.resize[0]}px")
+    if args.compile:
+        with step("Compiling backbone blocks (one-off)", verbose, indent=""):
+            compile_backbone(backbone)
+            warmup_backbone(backbone, geometry, device)
+
+    print(f"Settings: frame_view={frame_view} pooling={pooling} decode={args.decode} "
+          f"vr={'on (' + args.sbs_crop + ' eye)' if args.vr else 'off'} "
+          f"preprocess={'on' if args.preprocess else 'off'} "
+          f"token_cache={'on' if args.token_cache else 'off'}")
+    print(f"\n{len(videos)} video(s) to process under {target}")
+
     t0 = time.perf_counter()
     done = failed = 0
     for i, video in enumerate(videos, 1):
-        print(f"\n[{i}/{len(videos)}] {video}", flush=True)
+        print(f"\n[{i}/{len(videos)}] {video}  ({video.stat().st_size / 1024 ** 3:.1f} GiB)", flush=True)
+        t_video = time.perf_counter()
         try:
             status = process(video, args.out, args, model, data_cfg, device,
-                             pooling, crop_box, frame_view)
+                             pooling, crop_box, frame_view, backbone=backbone, geometry=geometry)
         except Exception as exc:  # keep going through a batch
             status = f"FAILED: {type(exc).__name__}: {exc}"
             failed += 1
         else:
             done += 1
-        print(f"          {status}", flush=True)
-    print(f"\n{done} processed, {failed} failed in {time.perf_counter() - t0:.1f}s")
+        print(f"  {status}  [{human_duration(time.perf_counter() - t_video)}]", flush=True)
+    print(f"\n{done} processed, {failed} failed in {human_duration(time.perf_counter() - t0)}")
 
 
 if __name__ == "__main__":

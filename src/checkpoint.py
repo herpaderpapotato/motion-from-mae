@@ -22,7 +22,12 @@ def resolve_checkpoint(checkpoint: str | Path) -> Path:
 
     from huggingface_hub import hf_hub_download
 
-    return Path(hf_hub_download(str(checkpoint), "model.safetensors"))
+    from src.progress import hub_fetch
+
+    return Path(hub_fetch(
+        lambda **kw: hf_hub_download(str(checkpoint), "model.safetensors", **kw),
+        f"head {checkpoint}",
+    ))
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict:
@@ -54,9 +59,10 @@ def load_dnx_model(
     has_ema = "ema_state_dict" in ckpt
     model.load_state_dict(ckpt["ema_state_dict"] if (use_ema and has_ema) else ckpt["model_state_dict"])
     model.eval().to(device)
+    f1 = ckpt.get("val_peak_f1_2")
     print(
-        f"Loaded DispositionNext ({'EMA' if (use_ema and has_ema) else 'raw'} weights): "
-        f"epoch={ckpt.get('epoch', '?')} val_peak_f1_2={ckpt.get('val_peak_f1_2')}"
+        f"Head: DispositionNext, {'EMA' if (use_ema and has_ema) else 'raw'} weights, "
+        f"epoch {ckpt.get('epoch', '?')}" + (f", val peak F1@2 {f1:.4f}" if isinstance(f1, float) else "")
     )
     return model, model_config, ckpt.get("data_config", {})
 

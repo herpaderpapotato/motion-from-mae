@@ -111,6 +111,12 @@ def compile_backbone(model: Any) -> None:
         model.blocks[i] = torch.compile(model.blocks[i])
 
 
+def warmup_backbone(model: Any, geometry: BackboneGeometry, device: torch.device) -> None:
+    """One dummy window, so torch.compile's ~25 s compile is paid here -- where it
+    can be named -- instead of stalling the first extraction progress bar."""
+    _assert_token_grid(model, geometry, torch.device(device))
+
+
 def _run_backbone(model: Any, geometry: BackboneGeometry, pixel_values: torch.Tensor) -> torch.Tensor:
     """[B, num_frames, 3, H, W] -> [B, num_patches, D]. The ViT's Conv3d tubelet
     embed wants channels first, hence the permute."""
@@ -126,7 +132,10 @@ def _resolve_backbone_source(checkpoint_id: str) -> tuple[Path, str | None]:
 
     from huggingface_hub import snapshot_download
 
-    local_dir = Path(snapshot_download(str(checkpoint_id)))
+    from src.progress import hub_fetch
+
+    local_dir = Path(hub_fetch(
+        lambda **kw: snapshot_download(str(checkpoint_id), **kw), f"backbone {checkpoint_id}"))
     # .../snapshots/<sha>/ -- the sha is the backbone identity the token cache keys on.
     revision = local_dir.name if local_dir.parent.name == "snapshots" else None
     return local_dir, revision

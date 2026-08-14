@@ -16,7 +16,10 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tempfile
 from pathlib import Path
+
+from src.progress import step
 
 DEFAULT_PREPROCESS_DIR = Path("data/video_preprocess_cache")
 
@@ -43,6 +46,36 @@ class PreprocessUnavailable(RuntimeError):
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _run_with_progress(cmd: list[str], total_frames: int, desc: str) -> subprocess.CompletedProcess:
+    """Run ffmpeg with a frame progress bar.
+
+    `-progress pipe:1` writes machine-readable key=value blocks to stdout, so the
+    bar is driven by ffmpeg's own frame counter. stderr goes to a temp file
+    rather than a pipe: nothing reads it while the transcode runs, and a full
+    pipe buffer would deadlock ffmpeg.
+    """
+    from tqdm import tqdm
+
+    cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True, bufsize=1)
+        bar = tqdm(total=total_frames, unit="frame", desc=desc, unit_scale=False, leave=True)
+        try:
+            for line in proc.stdout:
+                key, _, value = line.strip().partition("=")
+                value = value.strip()
+                if key == "frame" and value.isdigit():
+                    bar.update(min(int(value), total_frames) - bar.n)
+                elif key == "speed" and value not in ("", "N/A", "0x"):
+                    bar.set_postfix_str(value, refresh=False)
+        finally:
+            proc.stdout.close()
+            returncode = proc.wait()
+            bar.close()
+        err.seek(0)
+        return subprocess.CompletedProcess(cmd, returncode, "", err.read())
 
 
 def _ffmpeg_has(kind: str, name: str) -> bool:
@@ -134,7 +167,9 @@ def build(
 ) -> tuple[Path, int]:
     """Transcode [start_frame, end_frame) to a cropped/resized clip. Returns
     (path, first_source_frame)."""
-    info = probe_source(video_path)
+    with step("probing source", not quiet) as st:
+        info = probe_source(video_path)
+        st.note(f"{info['width']}x{info['height']} {info['codec']}")
     decoder = CUVID_DECODERS.get(info["codec"])
     if decoder is None or not _ffmpeg_has("decoders", decoder):
         raise PreprocessUnavailable(
@@ -168,15 +203,22 @@ def build(
         "-frames:v", str(n_frames), "-copyts",
         *encoder, str(tmp),
     ]
-    if not quiet:
-        print(f"Preprocessing {video_path.name} frames [{start_frame}, {end_frame}) "
-              f"-> {resize[1]}x{resize[0]} (crop {w}x{h}+{left}+{top}) ...")
-    proc = _run(cmd)
+    if quiet:
+        proc = _run(cmd)
+    else:
+        print(f"  preprocess: crop {w}x{h}+{left}+{top} -> {resize[1]}x{resize[0]}, "
+              f"{decoder} -> {encoder[1]}, frames [{start_frame}, {end_frame})")
+        # Bar total is the requested span, not the guard-padded -frames:v count:
+        # the guard frames are overhead, and counting them leaves a finished
+        # transcode sitting at 99%.
+        proc = _run_with_progress(cmd, end_frame - start_frame, "  transcoding")
     if proc.returncode or not tmp.exists():
         tmp.unlink(missing_ok=True)
         raise PreprocessUnavailable(f"ffmpeg preprocess failed: {proc.stderr.strip()[-400:]}")
 
-    first_pts, n_written = _probe_result(tmp)
+    with step("checking clip", not quiet) as st:
+        first_pts, n_written = _probe_result(tmp)
+        st.note(f"{n_written} frames")
     first_source_frame = int(round(first_pts * fps))
     if first_source_frame > start_frame or first_source_frame + n_written < end_frame:
         tmp.unlink(missing_ok=True)
@@ -228,7 +270,7 @@ def ensure(
     hit = find_covering(cache_dir, identity, start_frame, end_frame)
     if hit is not None:
         if not quiet:
-            print(f"Preprocess cache hit: {hit[0]}")
+            print(f"  preprocess cache hit: {hit[0].name}")
         return hit
     out_path = cache_dir / f"{identity}_f{start_frame}-{end_frame}.mp4"
     return build(Path(video_path), out_path, vr_mode, sbs_crop, crop_box, resize,
