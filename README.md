@@ -9,6 +9,13 @@ python predict.py --video video.mp4 --out video.funscript --vr --frame-view crop
 backbone it needs (`herpaderpapotato/motion_from_mae_extract`) and both are pulled into
 the HF cache on first use. It also accepts a local `.safetensors` export or a training `.pt`.
 
+Hub checkpoints are re-checked every run (~1 s), so a re-published head or backbone is
+picked up instead of being served stale from the cache; only a real download prints
+anything. `--checkpoint-revision <sha|tag>` pins the head and skips the check,
+`--offline` (or `HF_HUB_OFFLINE=1`) uses the cache as-is, and an unreachable hub falls
+back to the cache with a warning. A new **backbone** revision changes the token cache
+key, so cached tokens are re-extracted.
+
 Tokens are cached under `data/video_token_cache/` (`--no-token-cache` to disable,
 `--token-cache-dir` to move); a re-run or an interrupted run resumes from there.
 
@@ -43,6 +50,23 @@ genuinely CFR source the two are identical.
 Output never overwrites: if `video.funscript` exists the run writes
 `video.001.funscript`, then `.002`, and so on.
 
+Per-frame confidence is written as two extra funscript axes (version 1.1 `axes` list),
+on the same 0-100 integer scale as `pos`, **higher = more confident**:
+
+| axis | signal | reads as |
+|---|---|---|
+| `C1` | std of the blended HL-Gauss bin distribution | how tightly the head localised the position |
+| `C2` | \|expectation - mode\| decode gap | whether it is split between two positions, or just vague |
+
+Both come free from the distribution the position is already decoded from. The 0-100
+mapping is display scaling, not calibration (`CONF_*` in `src/infer.py`): the C1 floor
+is the head's training sigma (0.02; measured p1 over 36k real frames was 0.021) and its
+ceiling is the std of a uniform distribution, i.e. no information. They rank frames
+within a video — they are **not** error bars, and they measure amplitude uncertainty,
+not timing: the training loss is a soft-min over ±5-frame shifts, so a sharp
+distribution can still sit a few frames off. `--no-confidence-axes` drops them and the
+file to ~1/3 the size.
+
 Resulting funscripts should only be used to facilitate funscript creation. Any attempts to use the direct outputs is both unsupported and potentially a safety risk.
 
 | module | what |
@@ -57,4 +81,5 @@ Resulting funscripts should only be used to facilitate funscript creation. Any a
 | `src/infer.py` | sliding-window blend, hold gate, smoothing |
 | `src/postprocess.py` | `--postprocess` wave normalisation |
 | `src/checkpoint.py`, `src/token_cache.py`, `src/funscript.py` | loading, caching, output |
-| `src/progress.py` | timed step lines, quiet HF cache lookups |
+| `src/progress.py` | timed step lines |
+| `src/hub.py` | HF revision checks, cache/offline fallback |

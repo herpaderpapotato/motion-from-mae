@@ -15,6 +15,25 @@ HOLD_GATE_ACTIVITY_THRESHOLD = 0.35
 HOLD_GATE_MIN_RUN_S = 0.75
 DECODE_MODES = ("expectation", "mode")
 
+# Confidence scaling. The head is distributional (HL-Gauss over n_bins), so the
+# shape of the blended bin distribution is an uncertainty signal for free. Both
+# axes are monotone in uncertainty but UNCALIBRATED: they rank frames, they are
+# not probabilities or error bars until checked against labelled frames.
+#
+# C1 spread: the distribution's std in position units. The floor is the sigma
+# the head was trained against (dnx_losses.HLGAUSS_SIGMA) -- measured p1 over
+# 36k frames of a real video is 0.021, so the sharpest frames do reach it. The
+# ceiling is the std of a uniform distribution over [0, 1]: as spread out as
+# knowing nothing at all. Measured spread over that same video was p25 0.140,
+# p50 0.202, p95 0.279, which lands the median mid-scale.
+CONF_SPREAD_FLOOR = 0.02
+CONF_SPREAD_CEIL = 0.2887
+# C2 agreement: |expectation - mode| decode gap, zero for any single symmetric
+# peak, growing only when probability mass sits away from the peak -- the model
+# split between two positions rather than merely vague. Ceiling is the measured
+# p95 (0.252): by then the two decodes disagree about which stroke this is.
+CONF_GAP_CEIL = 0.25
+
 
 def decode_blended_positions(
     probs: np.ndarray, n_bins: int, decode: str = "expectation", radius: int = HLGAUSS_MODE_RADIUS,
@@ -28,16 +47,39 @@ def decode_blended_positions(
     return hlgauss_decode_mode(torch.from_numpy(probs), n_bins, radius=radius).numpy()
 
 
+def distribution_confidence(
+    probs: np.ndarray, n_bins: int, radius: int = HLGAUSS_MODE_RADIUS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """[T, n_bins] blended distribution -> (spread_conf, agreement_conf) in [0, 1].
+
+    Higher is more confident in both. See the CONF_* constants for the mapping;
+    they are display scaling, not calibration.
+    """
+    centers = (np.arange(n_bins) + 0.5) / n_bins
+    mean = (probs * centers[None, :]).sum(axis=-1)
+    variance = (probs * (centers[None, :] - mean[:, None]) ** 2).sum(axis=-1)
+    std = np.sqrt(np.clip(variance, 0.0, None))
+    spread = 1.0 - (std - CONF_SPREAD_FLOOR) / (CONF_SPREAD_CEIL - CONF_SPREAD_FLOOR)
+
+    mode = hlgauss_decode_mode(torch.from_numpy(probs), n_bins, radius=radius).numpy()
+    agreement = 1.0 - np.abs(mean - mode) / CONF_GAP_CEIL
+
+    return np.clip(spread, 0.0, 1.0), np.clip(agreement, 0.0, 1.0)
+
+
 def sliding_window_predict_dnx(
     model: DispositionNext, tokens: np.ndarray, device: torch.device,
     crop_slots: int = CROP_SLOTS, overlap: float = OVERLAP,
     decode: str = "expectation", decode_radius: int = HLGAUSS_MODE_RADIUS,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """Sliding crop_slots-slot windows blended with Bartlett weights in BIN
     PROBABILITY space (not decoded scalars), renormalised, then decoded.
     Activity is blended the same way in sigmoid space.
 
-    Returns (position [T], activity [T]), both in [0, 1], T = 2 * n_slots.
+    Returns (position [T], activity [T], confidence), all in [0, 1],
+    T = 2 * n_slots. `confidence` holds "spread" and "agreement" -- see
+    `distribution_confidence`. They are read off the same blended distribution
+    the position comes from, so they cost nothing extra to produce.
     """
     s = tokens.shape[0]
     n_bins = model.n_bins
@@ -85,7 +127,8 @@ def sliding_window_predict_dnx(
     probs_blend = probs_blend / np.clip(probs_blend.sum(axis=-1, keepdims=True), 1e-12, None)
     position = decode_blended_positions(probs_blend, n_bins, decode, decode_radius)
     activity = act_sum / weight_sum
-    return position, activity
+    spread, agreement = distribution_confidence(probs_blend, n_bins, decode_radius)
+    return position, activity, {"spread": spread, "agreement": agreement}
 
 
 def smooth_positions(position: np.ndarray, mode: str, window: int, polyorder: int = 2) -> np.ndarray:

@@ -32,6 +32,9 @@ from src.extract import extract_video_tokens, source_frame_times
 from src.funscript import predictions_to_funscript
 from src.hlgauss import HLGAUSS_MODE_RADIUS
 from src.infer import (
+    CONF_GAP_CEIL,
+    CONF_SPREAD_CEIL,
+    CONF_SPREAD_FLOOR,
     CROP_SLOTS,
     DECODE_MODES,
     HOLD_GATE_ACTIVITY_THRESHOLD,
@@ -157,12 +160,13 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     t0 = time.perf_counter()
     crop_slots = args.dnx_crop_slots
     stride_slots = min(max(1, args.dnx_stride or max(1, crop_slots // 2)), crop_slots)
-    position, activity = sliding_window_predict_dnx(
+    position, activity, confidence = sliding_window_predict_dnx(
         model, tokens, device, crop_slots=crop_slots, overlap=1.0 - (stride_slots / crop_slots),
         decode=args.decode, decode_radius=args.decode_radius,
     )
     position = position[:len(frame_idx)]
     activity = activity[:len(frame_idx)]
+    confidence = {k: v[:len(frame_idx)] for k, v in confidence.items()}
 
     if args.hold_gate:
         position = apply_hold_gate(
@@ -180,6 +184,26 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     if verbose:
         print(f"  head: {len(position)} frames in {time.perf_counter() - t0:.2f}s, "
               f"mean {position.mean():.3f}, std {position.std():.3f}")
+        print(f"  confidence: C1 spread {100 * confidence['spread'].mean():.0f}, "
+              f"C2 agreement {100 * confidence['agreement'].mean():.0f} (mean of 100)")
+
+    # Extra axes ride the main track's timestamps, so they must be built from
+    # the ungated, unsmoothed confidence -- those filters only touch position.
+    axes = None
+    if args.confidence_axes:
+        axes = {
+            "C1": {"values": confidence["spread"],
+                   "metadata": {"name": "confidence_spread",
+                                "description": "100 = bin distribution as sharp as the "
+                                               "HL-Gauss training sigma, 0 = too wide to place",
+                                "scale_floor": CONF_SPREAD_FLOOR, "scale_ceil": CONF_SPREAD_CEIL,
+                                "calibrated": False}},
+            "C2": {"values": confidence["agreement"],
+                   "metadata": {"name": "confidence_agreement",
+                                "description": "100 = expectation and mode decodes agree, "
+                                               "0 = split between two positions",
+                                "scale_ceil": CONF_GAP_CEIL, "calibrated": False}},
+        }
 
     # Action times come from the source's own frame timestamps; a stream whose
     # declared rate isn't its real one drifts the whole script otherwise.
@@ -199,6 +223,7 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     out_path = non_colliding_path(out or video.with_suffix(".funscript"))
     funscript = predictions_to_funscript(
         position, fps=feature_fps, start_time=args.start_time, frame_times=frame_times,
+        axes=axes,
         metadata={
             "timing": "source_pts" if frame_times is not None else "uniform_fps",
             "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
@@ -213,7 +238,8 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as fh:
         json.dump(funscript, fh)
-    status = f"-> {out_path} ({len(funscript['actions'])} actions)"
+    status = f"-> {out_path} ({len(funscript['actions'])} actions"
+    status += f", axes {'+'.join(a['id'] for a in funscript['axes'])})" if axes else ")"
 
     if args.save_activity:
         act_path = out_path.with_suffix(".activity.npy")
@@ -265,6 +291,12 @@ def main() -> None:
     parser.add_argument("--hold-gate-min-duration", type=float, default=HOLD_GATE_MIN_RUN_S,
                         help="Minimum sustained-low-activity duration in seconds")
     parser.add_argument("--save-activity", action="store_true", help="Write a sidecar .activity.npy")
+    parser.add_argument("--confidence-axes", dest="confidence_axes", action="store_true", default=True,
+                        help="Write per-frame confidence as extra funscript axes C1 (distribution "
+                             "spread) and C2 (expectation-vs-mode agreement), 0-100 like pos, "
+                             "higher = more confident. Uncalibrated: a ranking, not an error bar")
+    parser.add_argument("--no-confidence-axes", dest="confidence_axes", action="store_false",
+                        help="Position track only (~1/3 the file size)")
 
     parser.add_argument("--dnx-crop-slots", type=int, default=CROP_SLOTS,
                         help=f"Head window length in slots (default {CROP_SLOTS} = {CROP_SLOTS * 2} frames)")
