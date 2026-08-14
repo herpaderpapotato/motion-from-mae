@@ -17,7 +17,11 @@ back to the cache with a warning. A new **backbone** revision changes the token 
 key, so cached tokens are re-extracted.
 
 Tokens are cached under `data/video_token_cache/` (`--no-token-cache` to disable,
-`--token-cache-dir` to move); a re-run or an interrupted run resumes from there.
+`--token-cache-dir` to move); a re-run or an interrupted run resumes from there. What
+was probed from the source file — frame count, declared fps, and the per-frame
+timestamp table — is cached next to them in a small `_src_v1.npz` per video, keyed on
+path + size + mtime. None of it depends on the head or the settings, so a re-run with a
+different checkpoint skips the probes entirely.
 
 Two backbone families are supported, picked from what the head records — nothing to
 pass. A **VideoMAEv2** backbone is a checkpoint directory or HF repo (16-frame windows
@@ -42,7 +46,8 @@ triton-windows` on Windows). Worth it on a long run, not on a short one.
 There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
 
 Action timestamps come from the source's own per-frame presentation times (one ffprobe
-index read, ~3.5 s for 179k frames), not from a uniform grid at the declared frame rate.
+index read, ~3.5 s for 179k frames, cached per source file), not from a uniform grid at
+the declared frame rate.
 Some masters declare 60000/1001 but run at 59.9297, which drifts the whole script ~0.5 s
 by the end of a 50-minute file. `--timing nominal-fps` restores the old behaviour; on a
 genuinely CFR source the two are identical.

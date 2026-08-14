@@ -26,10 +26,56 @@ from src.backbone import (
     pooling_num_tokens,
 )
 from src.progress import step
-from src.token_cache import ResumableTokenCache, cache_path_for_video
+from src.token_cache import DEFAULT_CACHE_DIR, ResumableTokenCache, cache_path_for_video
 
 
-def decoder_timebase(video_path: Path) -> tuple[float, int]:
+# Sidecar holding what was probed from a source file: its declared rate, its
+# frame count, and its per-frame presentation times. All three are properties of
+# the file alone -- no backbone, framing or window enters into them -- so one
+# entry per video serves every later run, whatever the head or the settings.
+SOURCE_CACHE_VERSION = 1
+
+
+def source_cache_path(video_path: Path, cache_dir: Path) -> Path:
+    from src.token_cache import _fingerprint_video_file
+
+    video_path = Path(video_path)
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in video_path.stem)[:80]
+    fingerprint = _fingerprint_video_file(video_path)  # path + size + mtime
+    return Path(cache_dir) / f"{safe}__{fingerprint}_src_v{SOURCE_CACHE_VERSION}.npz"
+
+
+def _read_source_cache(path: Path | None) -> dict:
+    """Whatever the sidecar holds, or {} if it is missing, corrupt or truncated."""
+    if path is None or not path.exists():
+        return {}
+    try:
+        with np.load(str(path)) as z:
+            return {k: z[k] for k in z.files}
+    except Exception:
+        return {}
+
+
+def _write_source_cache(path: Path | None, entries: dict) -> None:
+    """Replace the sidecar with `entries`. Callers merge onto what they read, so
+    writing the fps does not drop an already-cached timestamp table.
+
+    Written via a temp file + replace: a run interrupted mid-write would
+    otherwise leave a half-written .npz that every later run has to discard.
+    A cache that cannot be written is not an error -- the probe still ran.
+    """
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp.npz")
+        np.savez(str(tmp), **entries)
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def decoder_timebase(video_path: Path, cache_dir: Path | None = None) -> tuple[float, int]:
     """(fps, total_frames) for time <-> frame-index conversion.
 
     Uses the stream's nominal rate (ffprobe r_frame_rate), not its average, so
@@ -38,6 +84,11 @@ def decoder_timebase(video_path: Path) -> tuple[float, int]:
     the real per-frame timestamps. The two disagree by 0.49 s over 50 minutes on
     a source that declares 60000/1001 and actually runs at 59.9297.
     """
+    cache_path = source_cache_path(video_path, cache_dir) if cache_dir is not None else None
+    cached = _read_source_cache(cache_path)
+    if "fps" in cached and "total_frames" in cached:
+        return float(cached["fps"]), int(cached["total_frames"])
+
     fps = None
     try:
         out = subprocess.run(
@@ -68,10 +119,14 @@ def decoder_timebase(video_path: Path) -> tuple[float, int]:
     if total_frames <= 0:
         meta = VideoDecoder(str(video_path), device="cpu", dimension_order="NHWC").metadata
         total_frames = int(meta.num_frames or 0)
-    return float(fps if fps is not None else (meta.average_fps or 30.0)), total_frames
+    fps = float(fps if fps is not None else (meta.average_fps or 30.0))
+    if total_frames > 0:  # a zero frame count is a failed probe, not a fact to cache
+        _write_source_cache(cache_path, {**cached, "fps": fps, "total_frames": total_frames})
+    return fps, total_frames
 
 
-def source_frame_times(video_path: Path, min_frames: int = 0) -> np.ndarray | None:
+def source_frame_times(video_path: Path, min_frames: int = 0,
+                       cache_dir: Path | None = None) -> tuple[np.ndarray | None, bool]:
     """Every video frame's presentation time in seconds, from the container index.
 
     The funscript is played against the SOURCE, so its actions have to carry the
@@ -79,28 +134,40 @@ def source_frame_times(video_path: Path, min_frames: int = 0) -> np.ndarray | No
     when the stream's declared rate is its actual one, and it often isn't: this
     library's 6K masters declare 60000/1001 (59.94006) but run at 59.9297, which
     is 0.49 s of accumulated skew over 50 minutes. Reading the index costs ~3.5 s
-    for 179k frames over SMB.
+    for 179k frames over SMB, and nothing about it changes between runs, so with
+    `cache_dir` it is read once per source file and reused.
 
-    Returns None if the table is unreadable or too short to cover the run, so the
-    caller can fall back to the uniform grid.
+    Returns (times, from_cache); times is None if the table is unreadable or too
+    short to cover the run, so the caller can fall back to the uniform grid.
     """
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video_path)],
-            capture_output=True, text=True, check=True,
-        )
-    except Exception:
-        return None
-    values = []
-    for token in out.stdout.split():
+    cache_path = source_cache_path(video_path, cache_dir) if cache_dir is not None else None
+    cached = _read_source_cache(cache_path)
+    times = cached.get("pts")
+    from_cache = times is not None
+
+    if times is None:
         try:
-            values.append(float(token))
-        except ValueError:  # a packet without a pts makes the whole table unusable
-            return None
-    if len(values) < max(1, min_frames):
-        return None
-    return np.sort(np.asarray(values, dtype=np.float64))
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video_path)],
+                capture_output=True, text=True, check=True,
+            )
+        except Exception:
+            return None, False
+        values = []
+        for token in out.stdout.split():
+            try:
+                values.append(float(token))
+            except ValueError:  # a packet without a pts makes the whole table unusable
+                return None, False
+        times = np.sort(np.asarray(values, dtype=np.float64))
+        # Cached before the length check: whether the table covers THIS run
+        # depends on the run, but the table itself is the same either way.
+        _write_source_cache(cache_path, {**cached, "pts": times})
+
+    if len(times) < max(1, min_frames):
+        return None, from_cache
+    return times, from_cache
 
 
 class EyeDecoder:
@@ -198,8 +265,9 @@ def extract_video_tokens(
         if compile_model:
             compile_backbone(model)
 
+    source_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR) if use_cache else None
     with step("reading source metadata", show_progress) as st:
-        fps_src, total_frames = decoder_timebase(video_path)
+        fps_src, total_frames = decoder_timebase(video_path, cache_dir=source_cache_dir)
         st.note(f"{total_frames} frames @ {fps_src:.3f} fps ({total_frames / max(fps_src, 1e-6) / 60:.1f} min)")
 
     start_frame = int(round((start_time or 0.0) * fps_src))

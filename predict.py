@@ -225,14 +225,17 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
     frame_times = None
     if args.timing == "source-pts":
         with step("reading frame timestamps", verbose) as st:
-            times = source_frame_times(video, min_frames=start_frame + len(position))
+            times, from_cache = source_frame_times(
+                video, min_frames=start_frame + len(position),
+                cache_dir=args.token_cache_dir if args.token_cache else None,
+            )
             if times is None:
                 st.note("unavailable, using the uniform fps grid")
             else:
                 frame_times = times[start_frame:start_frame + len(position)]
                 measured = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else feature_fps
                 st.note(f"{len(times)} frames, measured {measured:.4f} fps "
-                        f"(declared {feature_fps:.4f})")
+                        f"(declared {feature_fps:.4f})" + (", cached" if from_cache else ""))
 
     out_path = non_colliding_path(out or video.with_suffix(".funscript"))
     funscript = predictions_to_funscript(
@@ -332,7 +335,8 @@ def main() -> None:
                         help="--decode mode only: half-width in bins; 0 is a plain argmax")
 
     parser.add_argument("--token-cache", dest="token_cache", action="store_true", default=True,
-                        help="Cache/resume extracted tokens")
+                        help="Cache/resume extracted tokens, and the source probe "
+                             "(frame count, declared fps, frame timestamps)")
     parser.add_argument("--no-token-cache", dest="token_cache", action="store_false")
     parser.add_argument("--token-cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
 
