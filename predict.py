@@ -2,6 +2,8 @@
 
     python predict.py --video video.mp4 --out video.funscript --vr --frame-view crop
     python predict.py --video video.mp4 --out video.funscript --start-time 1106.3 --duration 200
+    python predict.py --video FOLDER    # every .mp4 under it without a funscript
+    python predict.py                   # file/folder picker
 
 Defaults to the published head (herpaderpapotato/motion_from_mae_alt), which names its
 own backbone; both are pulled from the HF cache on first use. CUDA required.
@@ -56,16 +58,154 @@ def non_colliding_path(path: Path, max_tries: int = 1000) -> Path:
     raise RuntimeError(f"no free filename for {path} after {max_tries} tries")
 
 
+def collect_videos(target: Path, exclude_dirs: tuple[Path, ...] = ()) -> list[Path]:
+    """Videos to process. A folder is searched recursively; a named file is always kept.
+
+    Folder search skips anything already scripted -- a batch is meant to be
+    re-runnable over a growing library without redoing finished work -- and
+    anything under `exclude_dirs`, which are our own caches of generated clips.
+    """
+    if not target.is_dir():
+        return [target]
+    excluded = [d.resolve() for d in exclude_dirs if d.is_dir()]
+    return [v for v in sorted(target.rglob("*.mp4"))
+            if not v.with_suffix(".funscript").exists()
+            and not any(v.resolve().is_relative_to(d) for d in excluded)]
+
+
+# --------------------------------------------------------------------------- #
+# GUI
+# --------------------------------------------------------------------------- #
+
+def pick_target() -> Path | None:
+    """Minimal picker: choose a file or a folder, then Run. Returns None if closed."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    chosen: list[Path] = []
+    root = tk.Tk()
+    root.title("Predict funscripts")
+    root.resizable(False, False)
+
+    var = tk.StringVar(value="")
+    frame = tk.Frame(root, padx=12, pady=12)
+    frame.pack()
+    tk.Label(frame, text="Video file, or folder to search recursively:").grid(
+        row=0, column=0, columnspan=3, sticky="w")
+    tk.Entry(frame, textvariable=var, width=64, state="readonly").grid(
+        row=1, column=0, columnspan=3, pady=(4, 8), sticky="we")
+
+    run = tk.Button(frame, text="Run", width=12, state="disabled")
+
+    def choose_file() -> None:
+        f = filedialog.askopenfilename(parent=root, title="Select video",
+                                       filetypes=[("Video", "*.mp4"),
+                                                  ("All files", "*.*")])
+        if f:
+            var.set(f)
+            run.config(state="normal")
+
+    def choose_dir() -> None:
+        d = filedialog.askdirectory(parent=root, title="Select folder")
+        if d:
+            var.set(d)
+            run.config(state="normal")
+
+    def start() -> None:
+        chosen.append(Path(var.get()))
+        root.destroy()
+
+    run.config(command=start)
+    tk.Button(frame, text="Select file...", width=14, command=choose_file).grid(
+        row=2, column=0, sticky="w")
+    tk.Button(frame, text="Select folder...", width=14, command=choose_dir).grid(
+        row=2, column=1, sticky="w", padx=6)
+    run.grid(row=2, column=2, sticky="e")
+
+    root.mainloop()
+    return chosen[0] if chosen else None
+
+
+# --------------------------------------------------------------------------- #
+
+def process(video: Path, out: Path | None, args: argparse.Namespace, model, data_cfg: dict,
+            device: torch.device, pooling, crop_box, frame_view: str) -> str:
+    """Predict one video and write its funscript. Returns a one-line status."""
+    tokens, frame_idx, meta = extract_video_tokens(
+        video, data_cfg["backbone_id"], device, args.vr, args.sbs_crop,
+        args.start_time, args.duration,
+        use_cache=args.token_cache, cache_dir=args.token_cache_dir,
+        show_progress=not args.no_progress, crop_box=crop_box, pooling=pooling,
+        preprocess=args.preprocess, preprocess_dir=args.preprocess_dir,
+        backbone_img_size=data_cfg.get("backbone_img_size"),
+        compile_model=args.compile,
+    )
+    feature_fps = float(meta["feature_fps"])
+    print(f"DNX tokens: {tokens.shape}, feature_fps={feature_fps:.3f}, pooling={pooling}, "
+          f"frame_view={frame_view}, decode={args.decode}")
+
+    t0 = time.perf_counter()
+    crop_slots = args.dnx_crop_slots
+    stride_slots = min(max(1, args.dnx_stride or max(1, crop_slots // 2)), crop_slots)
+    position, activity = sliding_window_predict_dnx(
+        model, tokens, device, crop_slots=crop_slots, overlap=1.0 - (stride_slots / crop_slots),
+        decode=args.decode, decode_radius=args.decode_radius,
+    )
+    position = position[:len(frame_idx)]
+    activity = activity[:len(frame_idx)]
+
+    if args.hold_gate:
+        position = apply_hold_gate(
+            position, activity, feature_fps,
+            activity_threshold=args.hold_gate_threshold, min_run_s=args.hold_gate_min_duration,
+        )
+
+    smooth_window = None
+    if args.dnx_smooth != "none":
+        smooth_window = args.dnx_smooth_window or (3 if args.dnx_smooth == "median" else 5)
+        position = smooth_positions(position, args.dnx_smooth, smooth_window, args.dnx_smooth_polyorder)
+        print(f"  smoothing: {args.dnx_smooth} w={smooth_window}")
+
+    print(f"Prediction: {len(position)} frames in {time.perf_counter() - t0:.2f}s  "
+          f"mean={position.mean():.4f}  std={position.std():.4f}")
+
+    out_path = non_colliding_path(out or video.with_suffix(".funscript"))
+    funscript = predictions_to_funscript(
+        position, fps=feature_fps, start_time=args.start_time,
+        metadata={
+            "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
+            "output_fps": feature_fps, "start_time_seconds": args.start_time,
+            "hold_gate": args.hold_gate,
+            "crop_slots": crop_slots, "stride_slots": stride_slots,
+            "smooth": args.dnx_smooth, "smooth_window": smooth_window,
+            "frame_view": frame_view, "pooling": pooling, "decode": args.decode,
+            "decode_radius": args.decode_radius if args.decode == "mode" else None,
+        },
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as fh:
+        json.dump(funscript, fh)
+    status = f"Saved funscript -> {out_path}"
+
+    if args.save_activity:
+        act_path = out_path.with_suffix(".activity.npy")
+        np.save(act_path, activity)
+        status += f", activity -> {act_path.name}"
+    return status
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Predict disposition with DispositionNext (DNX)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--video", type=Path, required=True)
+    parser.add_argument("--video", type=Path, default=None,
+                        help="Video file, or folder searched recursively for .mp4 without a "
+                             "funscript. Omit to open a picker")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT,
                         help="HF repo id, .safetensors export, or training .pt")
     parser.add_argument("--out", type=Path, default=None,
-                        help="Output funscript path (default: <video>.funscript)")
+                        help="Output funscript path (default: <video>.funscript). Single video only")
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--vr", dest="vr", action="store_true", default=True,
@@ -127,6 +267,21 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    target = args.video or pick_target()
+    if target is None:
+        print("cancelled")
+        return
+    target = Path(target)
+    if not target.exists():
+        parser.error(f"not found: {target}")
+
+    videos = collect_videos(target, exclude_dirs=(args.preprocess_dir, args.token_cache_dir))
+    if not videos:
+        print(f"no unscripted .mp4 under {target}")
+        return
+    if args.out is not None and len(videos) > 1:
+        parser.error(f"--out takes a single video, but {len(videos)} were found under {target}")
+
     device = torch.device(args.device)
     if device.type != "cuda":
         parser.error("CUDA is required (torchcodec GPU decode)")
@@ -150,66 +305,21 @@ def main() -> None:
     crop_box = FULL_FRAME_CROP_BOX if use_full_frame else None
     pooling = resolve_pooling_for_head(model)
 
-    tokens, frame_idx, meta = extract_video_tokens(
-        args.video, data_cfg["backbone_id"], device, args.vr, args.sbs_crop,
-        args.start_time, args.duration,
-        use_cache=args.token_cache, cache_dir=args.token_cache_dir,
-        show_progress=not args.no_progress, crop_box=crop_box, pooling=pooling,
-        preprocess=args.preprocess, preprocess_dir=args.preprocess_dir,
-        backbone_img_size=data_cfg.get("backbone_img_size"),
-        compile_model=args.compile,
-    )
-    feature_fps = float(meta["feature_fps"])
-    print(f"DNX tokens: {tokens.shape}, feature_fps={feature_fps:.3f}, pooling={pooling}, "
-          f"frame_view={frame_view}, decode={args.decode}")
-
+    print(f"{len(videos)} video(s) under {target}")
     t0 = time.perf_counter()
-    crop_slots = args.dnx_crop_slots
-    stride_slots = min(max(1, args.dnx_stride or max(1, crop_slots // 2)), crop_slots)
-    position, activity = sliding_window_predict_dnx(
-        model, tokens, device, crop_slots=crop_slots, overlap=1.0 - (stride_slots / crop_slots),
-        decode=args.decode, decode_radius=args.decode_radius,
-    )
-    position = position[:len(frame_idx)]
-    activity = activity[:len(frame_idx)]
-
-    if args.hold_gate:
-        position = apply_hold_gate(
-            position, activity, feature_fps,
-            activity_threshold=args.hold_gate_threshold, min_run_s=args.hold_gate_min_duration,
-        )
-
-    smooth_window = None
-    if args.dnx_smooth != "none":
-        smooth_window = args.dnx_smooth_window or (3 if args.dnx_smooth == "median" else 5)
-        position = smooth_positions(position, args.dnx_smooth, smooth_window, args.dnx_smooth_polyorder)
-        print(f"  smoothing: {args.dnx_smooth} w={smooth_window}")
-
-    print(f"Prediction: {len(position)} frames in {time.perf_counter() - t0:.2f}s  "
-          f"mean={position.mean():.4f}  std={position.std():.4f}")
-
-    out_path = non_colliding_path(args.out or args.video.with_suffix(".funscript"))
-    funscript = predictions_to_funscript(
-        position, fps=feature_fps, start_time=args.start_time,
-        metadata={
-            "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
-            "output_fps": feature_fps, "start_time_seconds": args.start_time,
-            "hold_gate": args.hold_gate,
-            "crop_slots": crop_slots, "stride_slots": stride_slots,
-            "smooth": args.dnx_smooth, "smooth_window": smooth_window,
-            "frame_view": frame_view, "pooling": pooling, "decode": args.decode,
-            "decode_radius": args.decode_radius if args.decode == "mode" else None,
-        },
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as fh:
-        json.dump(funscript, fh)
-    print(f"Saved funscript -> {out_path}")
-
-    if args.save_activity:
-        act_path = out_path.with_suffix(".activity.npy")
-        np.save(act_path, activity)
-        print(f"Saved activity -> {act_path}")
+    done = failed = 0
+    for i, video in enumerate(videos, 1):
+        print(f"\n[{i}/{len(videos)}] {video}", flush=True)
+        try:
+            status = process(video, args.out, args, model, data_cfg, device,
+                             pooling, crop_box, frame_view)
+        except Exception as exc:  # keep going through a batch
+            status = f"FAILED: {type(exc).__name__}: {exc}"
+            failed += 1
+        else:
+            done += 1
+        print(f"          {status}", flush=True)
+    print(f"\n{done} processed, {failed} failed in {time.perf_counter() - t0:.1f}s")
 
 
 if __name__ == "__main__":
