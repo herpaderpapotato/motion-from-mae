@@ -68,7 +68,7 @@ def main() -> None:
                         help="Output funscript path (default: <video>.funscript)")
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--vr", dest="vr", action="store_true", default=False,
+    parser.add_argument("--vr", dest="vr", action="store_true", default=True,
                         help="VR / SBS video -- crop a single eye before decode")
     parser.add_argument("--no-vr", dest="vr", action="store_false")
     parser.add_argument("--sbs-crop", type=str, default="left", choices=["left", "right"],
