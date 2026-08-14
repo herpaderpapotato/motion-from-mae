@@ -38,32 +38,6 @@ def step(message: str, enabled: bool = True, indent: str = "  "):
     print(f"{' '.join(handle.notes) or 'ok'} ({time.perf_counter() - t0:.1f}s)", flush=True)
 
 
-def hub_fetch(fetch, what: str):
-    """Resolve an HF repo through `fetch(local_files_only=...)`.
-
-    A cache hit stays silent -- hub_hub's own "Fetching N files" bars fire on
-    every run and say nothing about a download that isn't happening. A real
-    download is announced and keeps its progress bars.
-    """
-    from huggingface_hub.utils import (
-        are_progress_bars_disabled,
-        disable_progress_bars,
-        enable_progress_bars,
-    )
-
-    was_disabled = are_progress_bars_disabled()
-    disable_progress_bars()
-    try:
-        return fetch(local_files_only=True)
-    except Exception:
-        pass
-    finally:
-        if not was_disabled:
-            enable_progress_bars()
-    print(f"Downloading {what} from Hugging Face (first run only) ...", flush=True)
-    return fetch(local_files_only=False)
-
-
 def human_duration(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     if seconds < 60:

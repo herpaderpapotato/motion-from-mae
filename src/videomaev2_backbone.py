@@ -254,10 +254,13 @@ def resolve_videomaev2_source(checkpoint_id: str | Path) -> tuple[Path, str | No
 
     from huggingface_hub import snapshot_download
 
-    from src.progress import hub_fetch
+    from src.hub import resolve
 
-    local_dir = Path(hub_fetch(
-        lambda **kw: snapshot_download(str(checkpoint_id), **kw), f"backbone {checkpoint_id}"))
+    local_dir = resolve(
+        lambda **kw: snapshot_download(str(checkpoint_id), **kw), str(checkpoint_id),
+        f"backbone {checkpoint_id}",
+        update_note="(token caches keyed on the old revision will be re-extracted)",
+    )
     if not is_videomaev2_dir(local_dir):
         raise SystemExit(f"{checkpoint_id} is not a VideoMAEv2 checkpoint repo")
     # .../snapshots/<sha>/ -- the sha is the backbone identity the token cache keys on.

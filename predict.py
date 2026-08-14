@@ -232,6 +232,9 @@ def main() -> None:
                              "funscript. Omit to open a picker")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT,
                         help="HF repo id, .safetensors export, or training .pt")
+    parser.add_argument("--checkpoint-revision", type=str, default=None,
+                        help="Pin the HF head to a commit sha or tag (default: the hub's "
+                             "current revision, re-checked every run)")
     parser.add_argument("--out", type=Path, default=None,
                         help="Output funscript path (default: <video>.funscript). Single video only")
     parser.add_argument("--device", type=str, default="cuda")
@@ -296,10 +299,17 @@ def main() -> None:
                         help="torch.compile the backbone blocks. Costs ~25s of compile once, then "
                              "measured 1.10x at 384 and 1.27x at 224 on a 3090. Needs triton "
                              "(on Windows: pip install triton-windows)")
+    parser.add_argument("--offline", action="store_true",
+                        help="Never contact the hub: use whatever revision is already in the HF "
+                             "cache. Otherwise every run checks the hub and pulls a newer one")
     parser.add_argument("--no-progress", action="store_true",
                         help="Quiet: no progress bars or per-phase status lines, one line per video")
 
     args = parser.parse_args()
+    if args.offline:
+        from src.hub import set_offline
+
+        set_offline()
 
     target = args.video or pick_target()
     if target is None:
@@ -331,7 +341,9 @@ def main() -> None:
     torch.cuda.set_device(device)
     print(f"Device: {device} ({torch.cuda.get_device_name(device)})")
 
-    model, model_cfg, data_cfg = load_dnx_model(args.checkpoint, device, use_ema=not args.use_raw_weights)
+    model, model_cfg, data_cfg = load_dnx_model(
+        args.checkpoint, device, use_ema=not args.use_raw_weights,
+        revision=args.checkpoint_revision)
     frame_view = args.frame_view
     if frame_view == "auto":
         frame_view = "full" if data_cfg.get("frame_mode") == "full" else "crop"
@@ -347,7 +359,9 @@ def main() -> None:
     with step(f"Loading backbone {backbone_id}", verbose, indent="") as st:
         backbone, geometry = load_backbone(
             backbone_id, device=device, img_size=data_cfg.get("backbone_img_size"))
-        st.note(f"{geometry.slug}, {geometry.window}-frame windows @ {geometry.resize[0]}px")
+        rev = geometry.backbone_revision
+        st.note((f"{rev[:7]}, " if rev else "")
+                + f"{geometry.slug}, {geometry.window}-frame windows @ {geometry.resize[0]}px")
     if args.compile:
         with step("Compiling backbone blocks (one-off)", verbose, indent=""):
             compile_backbone(backbone)

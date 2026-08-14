@@ -132,10 +132,15 @@ def _resolve_backbone_source(checkpoint_id: str) -> tuple[Path, str | None]:
 
     from huggingface_hub import snapshot_download
 
-    from src.progress import hub_fetch
+    from src.hub import resolve
 
-    local_dir = Path(hub_fetch(
-        lambda **kw: snapshot_download(str(checkpoint_id), **kw), f"backbone {checkpoint_id}"))
+    local_dir = resolve(
+        lambda **kw: snapshot_download(str(checkpoint_id), **kw), str(checkpoint_id),
+        f"backbone {checkpoint_id}",
+        # The revision is part of the token cache key, so a new one means every
+        # cached token file is rebuilt -- worth saying before the wait, not after.
+        update_note="(token caches keyed on the old revision will be re-extracted)",
+    )
     # .../snapshots/<sha>/ -- the sha is the backbone identity the token cache keys on.
     revision = local_dir.name if local_dir.parent.name == "snapshots" else None
     return local_dir, revision

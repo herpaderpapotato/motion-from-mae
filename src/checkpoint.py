@@ -14,20 +14,24 @@ DEFAULT_CHECKPOINT = "herpaderpapotato/motion_from_mae_alt"
 SAFETENSORS_FORMAT = "dnx_inference_v1"
 
 
-def resolve_checkpoint(checkpoint: str | Path) -> Path:
-    """A local path as-is, or an HF repo id downloaded to the hub cache."""
+def resolve_checkpoint(checkpoint: str | Path, revision: str | None = None) -> Path:
+    """A local path as-is, or an HF repo id resolved against the hub cache.
+
+    Without `revision` the hub's current commit is used, so a re-published head
+    is picked up rather than served stale from the cache.
+    """
     path = Path(checkpoint)
     if path.exists():
         return path
 
     from huggingface_hub import hf_hub_download
 
-    from src.progress import hub_fetch
+    from src.hub import resolve
 
-    return Path(hub_fetch(
+    return resolve(
         lambda **kw: hf_hub_download(str(checkpoint), "model.safetensors", **kw),
-        f"head {checkpoint}",
-    ))
+        str(checkpoint), f"head {checkpoint}", revision=revision,
+    )
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict:
@@ -52,17 +56,23 @@ def load_checkpoint(path: Path, device: torch.device) -> dict:
 
 def load_dnx_model(
     checkpoint: str | Path, device: torch.device, use_ema: bool = True,
+    revision: str | None = None,
 ) -> tuple[DispositionNext, dict, dict]:
-    ckpt = load_checkpoint(resolve_checkpoint(checkpoint), device)
+    from src.hub import hub_revision
+
+    path = resolve_checkpoint(checkpoint, revision)
+    ckpt = load_checkpoint(path, device)
     model_config = ckpt["model_config"]
     model = DispositionNext(**extract_dnx_config(model_config))
     has_ema = "ema_state_dict" in ckpt
     model.load_state_dict(ckpt["ema_state_dict"] if (use_ema and has_ema) else ckpt["model_state_dict"])
     model.eval().to(device)
     f1 = ckpt.get("val_peak_f1_2")
+    revision = hub_revision(path)
     print(
-        f"Head: DispositionNext, {'EMA' if (use_ema and has_ema) else 'raw'} weights, "
-        f"epoch {ckpt.get('epoch', '?')}" + (f", val peak F1@2 {f1:.4f}" if isinstance(f1, float) else "")
+        f"Head: {checkpoint}" + (f" @ {revision[:7]}" if revision else "")
+        + f", {'EMA' if (use_ema and has_ema) else 'raw'} weights, epoch {ckpt.get('epoch', '?')}"
+        + (f", val peak F1@2 {f1:.4f}" if isinstance(f1, float) else "")
     )
     return model, model_config, ckpt.get("data_config", {})
 
