@@ -32,11 +32,11 @@ from src.token_cache import ResumableTokenCache, cache_path_for_video
 def decoder_timebase(video_path: Path) -> tuple[float, int]:
     """(fps, total_frames) for time <-> frame-index conversion.
 
-    Uses the stream's nominal rate (ffprobe r_frame_rate), not its average: the
-    two differ whenever the container duration disagrees with nb_frames /
-    r_frame_rate, and the average drifts by ~20 frames over a 35-minute file --
-    which lands as a phase slip between the video and the timestamps written into
-    the funscript.
+    Uses the stream's nominal rate (ffprobe r_frame_rate), not its average, so
+    the frame grid and the cache identity keyed on it stay stable for a file.
+    This is NOT what times the funscript: see `source_frame_times`, which reads
+    the real per-frame timestamps. The two disagree by 0.49 s over 50 minutes on
+    a source that declares 60000/1001 and actually runs at 59.9297.
     """
     fps = None
     try:
@@ -57,9 +57,50 @@ def decoder_timebase(video_path: Path) -> tuple[float, int]:
 
     from torchcodec.decoders import VideoDecoder
 
-    meta = VideoDecoder(str(video_path), device="cpu", dimension_order="NHWC").metadata
+    # Header-only probe. The default "exact" seek mode builds a full frame index,
+    # which is a demux scan of the entire file -- measured 55 s on a 24 GiB 8K
+    # source -- and none of it is used here: this handle decodes nothing, and
+    # under --preprocess torchcodec never touches the source at all. Fall back to
+    # the scan only when the container carries no frame count of its own.
+    meta = VideoDecoder(str(video_path), device="cpu", dimension_order="NHWC",
+                        seek_mode="approximate").metadata
     total_frames = int(meta.num_frames or 0)
+    if total_frames <= 0:
+        meta = VideoDecoder(str(video_path), device="cpu", dimension_order="NHWC").metadata
+        total_frames = int(meta.num_frames or 0)
     return float(fps if fps is not None else (meta.average_fps or 30.0)), total_frames
+
+
+def source_frame_times(video_path: Path, min_frames: int = 0) -> np.ndarray | None:
+    """Every video frame's presentation time in seconds, from the container index.
+
+    The funscript is played against the SOURCE, so its actions have to carry the
+    source's real frame times. Synthesising them from a single fps is only right
+    when the stream's declared rate is its actual one, and it often isn't: this
+    library's 6K masters declare 60000/1001 (59.94006) but run at 59.9297, which
+    is 0.49 s of accumulated skew over 50 minutes. Reading the index costs ~3.5 s
+    for 179k frames over SMB.
+
+    Returns None if the table is unreadable or too short to cover the run, so the
+    caller can fall back to the uniform grid.
+    """
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, check=True,
+        )
+    except Exception:
+        return None
+    values = []
+    for token in out.stdout.split():
+        try:
+            values.append(float(token))
+        except ValueError:  # a packet without a pts makes the whole table unusable
+            return None
+    if len(values) < max(1, min_frames):
+        return None
+    return np.sort(np.asarray(values, dtype=np.float64))
 
 
 class EyeDecoder:

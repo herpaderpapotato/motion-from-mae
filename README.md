@@ -34,6 +34,12 @@ triton-windows` on Windows). Worth it on a long run, not on a short one.
 
 There's also a token cache by default which speeds things up if only the head model is updated. `--no-token-cache` to opt out on that.
 
+Action timestamps come from the source's own per-frame presentation times (one ffprobe
+index read, ~3.5 s for 179k frames), not from a uniform grid at the declared frame rate.
+Some masters declare 60000/1001 but run at 59.9297, which drifts the whole script ~0.5 s
+by the end of a 50-minute file. `--timing nominal-fps` restores the old behaviour; on a
+genuinely CFR source the two are identical.
+
 Output never overwrites: if `video.funscript` exists the run writes
 `video.001.funscript`, then `.002`, and so on.
 

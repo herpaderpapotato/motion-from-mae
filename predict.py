@@ -28,7 +28,7 @@ from src.backbone import (
     warmup_backbone,
 )
 from src.checkpoint import DEFAULT_CHECKPOINT, load_dnx_model, resolve_pooling_for_head
-from src.extract import extract_video_tokens
+from src.extract import extract_video_tokens, source_frame_times
 from src.funscript import predictions_to_funscript
 from src.hlgauss import HLGAUSS_MODE_RADIUS
 from src.infer import (
@@ -181,10 +181,26 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
         print(f"  head: {len(position)} frames in {time.perf_counter() - t0:.2f}s, "
               f"mean {position.mean():.3f}, std {position.std():.3f}")
 
+    # Action times come from the source's own frame timestamps; a stream whose
+    # declared rate isn't its real one drifts the whole script otherwise.
+    start_frame = int(round(args.start_time * feature_fps))
+    frame_times = None
+    if args.timing == "source-pts":
+        with step("reading frame timestamps", verbose) as st:
+            times = source_frame_times(video, min_frames=start_frame + len(position))
+            if times is None:
+                st.note("unavailable, using the uniform fps grid")
+            else:
+                frame_times = times[start_frame:start_frame + len(position)]
+                measured = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 1 else feature_fps
+                st.note(f"{len(times)} frames, measured {measured:.4f} fps "
+                        f"(declared {feature_fps:.4f})")
+
     out_path = non_colliding_path(out or video.with_suffix(".funscript"))
     funscript = predictions_to_funscript(
-        position, fps=feature_fps, start_time=args.start_time,
+        position, fps=feature_fps, start_time=args.start_time, frame_times=frame_times,
         metadata={
+            "timing": "source_pts" if frame_times is not None else "uniform_fps",
             "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
             "output_fps": feature_fps, "start_time_seconds": args.start_time,
             "hold_gate": args.hold_gate,
@@ -230,6 +246,11 @@ def main() -> None:
                              "crop, 'full' the whole eye. 'auto' follows the checkpoint's "
                              "data_config['frame_mode']")
 
+    parser.add_argument("--timing", choices=["source-pts", "nominal-fps"], default="source-pts",
+                        help="Where action timestamps come from: the source's own per-frame "
+                             "presentation times, or a uniform grid at the stream's declared "
+                             "frame rate. They differ whenever a container's nominal rate isn't "
+                             "its real one (measured: 0.49 s of drift over a 50-minute file)")
     parser.add_argument("--start-time", type=float, default=0.0,
                         help="Start time in seconds")
     parser.add_argument("--duration", type=float, default=None,

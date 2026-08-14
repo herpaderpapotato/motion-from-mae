@@ -199,6 +199,13 @@ def build(
         "-crop", f"{top}x{bottom}x{left}x{right}",
         "-i", str(video_path),
         "-an", "-sn", "-dn",
+        # The clip is addressed by FRAME INDEX with a source-frame offset, so the
+        # one thing that must hold is clip frame k == source frame k+offset.
+        # ffmpeg's default -fps_mode auto is free to duplicate or drop frames to
+        # force CFR on a source whose real cadence isn't its nominal rate (this
+        # library's are: 59.9297 measured vs 59.9401 nominal). passthrough hands
+        # every frame over with its own timestamp instead.
+        "-fps_mode", "passthrough",
         "-vf", f"scale_cuda={resize[1]}:{resize[0]}:interp_algo=bilinear:format=nv12",
         "-frames:v", str(n_frames), "-copyts",
         *encoder, str(tmp),
