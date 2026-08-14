@@ -164,7 +164,7 @@ def build(
         "-crop", f"{top}x{bottom}x{left}x{right}",
         "-i", str(video_path),
         "-an", "-sn", "-dn",
-        "-vf", f"scale_cuda={resize[1]}:{resize[0]}:interp_algo=bilinear",
+        "-vf", f"scale_cuda={resize[1]}:{resize[0]}:interp_algo=bilinear:format=nv12",
         "-frames:v", str(n_frames), "-copyts",
         *encoder, str(tmp),
     ]
