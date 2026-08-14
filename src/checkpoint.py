@@ -10,7 +10,7 @@ import torch
 from src.backbone import pooling_from_num_tokens
 from src.disposition_next import DispositionNext, extract_dnx_config
 
-DEFAULT_CHECKPOINT = "herpaderpapotato/motion_from_mae"
+DEFAULT_CHECKPOINT = "herpaderpapotato/motion_from_mae_alt"
 SAFETENSORS_FORMAT = "dnx_inference_v1"
 
 

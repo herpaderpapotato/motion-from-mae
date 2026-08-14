@@ -3,7 +3,7 @@
     python predict.py --video video.mp4 --out video.funscript --vr --frame-view crop
     python predict.py --video video.mp4 --out video.funscript --start-time 1106.3 --duration 200
 
-Defaults to the published head (herpaderpapotato/motion_from_mae), which names its
+Defaults to the published head (herpaderpapotato/motion_from_mae_alt), which names its
 own backbone; both are pulled from the HF cache on first use. CUDA required.
 """
 
