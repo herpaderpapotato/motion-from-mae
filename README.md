@@ -7,7 +7,8 @@ python predict.py --video video.mp4 --out video.funscript --vr --frame-view crop
 
 `--checkpoint` defaults to `herpaderpapotato/motion_from_mae`; the head records the
 backbone it needs (`herpaderpapotato/motion_from_mae_extract`) and both are pulled into
-the HF cache on first use. It also accepts a local `.safetensors` export or a training `.pt`.
+the HF cache on first use. It also accepts a local `.safetensors` export or a training
+`.pt`. `--backbone <repo id|path>` overrides the backbone the head names.
 
 Hub checkpoints are re-checked every run (~1 s), so a re-published head or backbone is
 picked up instead of being served stale from the cache; only a real download prints
@@ -52,8 +53,20 @@ Some masters declare 60000/1001 but run at 59.9297, which drifts the whole scrip
 by the end of a 50-minute file. `--timing nominal-fps` restores the old behaviour; on a
 genuinely CFR source the two are identical.
 
+Output is simplified to keyframes by default (savgol lowpass → extrema seed → greedy
+pchip refine within `--simplify-max-err` → device pass for `--simplify-min-amp` /
+`--simplify-min-gap-ms`), and the dense per-frame track is kept beside it as
+`video.raw.funscript`. `--no-simplify` writes the dense track alone. The simplified
+file's `metadata.simplification` carries the point counts and the reconstruction error
+against the raw track, both pchip and linear, in 0-100 units.
+
+Every funscript records what made it: `model_hash` (sha256 over the head's weight file
+and its configs), the checkpoint id/revision, and the backbone id/revision.
+
 Output never overwrites: if `video.funscript` exists the run writes
-`video.001.funscript`, then `.002`, and so on.
+`video.001.funscript` (with `video.001.raw.funscript` beside it), then `.002`, and so
+on. In folder mode a video that already has a funscript is skipped; `--force` processes
+it anyway into a new numbered pair, and `--overwrite` replaces the existing pair.
 
 Confidence is written as three extra funscript axes (version 1.1 `axes` list), on the
 same 0-100 integer scale as `pos`, **higher = more confident**:
@@ -89,7 +102,8 @@ Resulting funscripts should only be used to facilitate funscript creation. Any a
 | `src/videomaev2_backbone.py` | the VideoMAEv2 ViT |
 | `src/vjepa21_backbone.py` | the V-JEPA 2.1 ViT (RoPE) |
 | `src/disposition_next.py`, `src/hlgauss.py` | the head |
-| `src/infer.py` | sliding-window blend, hold gate, smoothing |
+| `src/infer.py` | sliding-window blend, hold gate, confidence axes |
+| `src/simplify.py` | per-frame track → keyframes |
 | `src/postprocess.py` | `--postprocess` wave normalisation |
 | `src/checkpoint.py`, `src/token_cache.py`, `src/funscript.py` | loading, caching, output |
 | `src/progress.py` | timed step lines |

@@ -172,7 +172,7 @@ def _detect_family(source: Path, checkpoint_id: str) -> str:
 
 def load_backbone(
     checkpoint_id: str, device: str | torch.device = "cuda", slug_override: str | None = None,
-    img_size: int | None = None,
+    img_size: int | None = None, window: int | None = None,
 ) -> tuple[Any, BackboneGeometry]:
     """Load the frozen backbone from a local path or an HF repo id.
 
@@ -195,7 +195,14 @@ def load_backbone(
     family = _detect_family(source, str(checkpoint_id))
     if family == "vjepa21":
         return _load_vjepa21_backbone(
-            str(checkpoint_id), source, revision, device, slug_override, img_size,
+            str(checkpoint_id), source, revision, device, slug_override, img_size, window,
+        )
+    if window is not None:
+        # Every other family's window is pinned by its temporal position
+        # embedding, so this is a mismatch to name, not a value to apply.
+        raise ValueError(
+            f"window={window} was requested but {family} has a fixed window; only V-JEPA 2.1 "
+            "(RoPE) takes an override."
         )
     if img_size is not None:
         raise ValueError(
@@ -250,9 +257,24 @@ def load_backbone(
 VJEPA21_WINDOW_FRAMES = 64
 
 
+def window_cache_tag(window: int | None, family: str | None = None) -> str:
+    """Cache-identity suffix for a backbone window; empty for the default.
+
+    Empty-for-default keeps every cache written before the window was
+    configurable at its exact filename and fingerprint. Pass `family` when the
+    window comes off a geometry rather than off config -- a non-2.1 window is
+    native rather than an override and must not tag.
+    """
+    if family is not None and family != "vjepa21":
+        return ""
+    if window is None or int(window) == VJEPA21_WINDOW_FRAMES:
+        return ""
+    return f"_w{int(window)}"
+
+
 def _load_vjepa21_backbone(
     checkpoint_id: str, source: Path, revision: str | None, device: torch.device,
-    slug_override: str | None, img_size: int | None,
+    slug_override: str | None, img_size: int | None, window: int | None = None,
 ) -> tuple[Any, BackboneGeometry]:
     """Load the vendored V-JEPA 2.1 ViT (frozen) + geometry from a release or
     LoRA-merged `.pt`. Normalisation is ImageNet, the reference default."""
@@ -271,6 +293,10 @@ def _load_vjepa21_backbone(
 
     crop = (mc["img_size"], mc["img_size"])
     patch = mc["patch_size"]
+    if window is not None and (window <= 0 or window % mc["tubelet_size"] != 0):
+        raise ValueError(
+            f"window={window} must be a positive multiple of tubelet_size={mc['tubelet_size']}"
+        )
     size_code = {768: "b", 1024: "l", 1280: "h", 1408: "g"}.get(mc["embed_dim"], str(mc["embed_dim"]))
     slug = f"vjepa21-{size_code}-{crop[0]}"
     if mc.get("derived"):
@@ -294,7 +320,7 @@ def _load_vjepa21_backbone(
         hidden_dim=mc["embed_dim"],
         tubelet_size=mc["tubelet_size"],
         patch_size=patch,
-        window=VJEPA21_WINDOW_FRAMES,
+        window=int(window) if window is not None else VJEPA21_WINDOW_FRAMES,
         spatial_grid=(crop[0] // patch, crop[1] // patch),
         resize=crop,
         norm_mean=VJEPA21_NORM_MEAN,

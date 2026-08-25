@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import torch
 
 from src.backbone import pooling_from_num_tokens
-from src.disposition_next import DispositionNext, extract_dnx_config
+from src.disposition_next import DispositionNext, extract_dnx_config, upgrade_dnx_state
 
 DEFAULT_CHECKPOINT = "herpaderpapotato/motion_from_mae_alt"
 SAFETENSORS_FORMAT = "dnx_inference_v1"
@@ -54,10 +55,28 @@ def load_checkpoint(path: Path, device: torch.device) -> dict:
     return ckpt
 
 
+def model_hash(path: Path, model_config: dict, data_config: dict, use_ema: bool) -> str:
+    """sha256 over the weight file and the configs it was built with.
+
+    Written into every funscript: it answers "which model produced this" for a
+    local export, a training .pt and a hub revision alike.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    h.update(json.dumps({"model_config": model_config, "data_config": data_config,
+                         "weights": "ema" if use_ema else "raw"},
+                        sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()
+
+
 def load_dnx_model(
     checkpoint: str | Path, device: torch.device, use_ema: bool = True,
     revision: str | None = None,
-) -> tuple[DispositionNext, dict, dict]:
+) -> tuple[DispositionNext, dict, dict, dict]:
+    """Returns (model, model_config, data_config, provenance) -- the last a
+    small dict of what produced the weights, for the output's metadata."""
     from src.hub import hub_revision
 
     path = resolve_checkpoint(checkpoint, revision)
@@ -65,16 +84,27 @@ def load_dnx_model(
     model_config = ckpt["model_config"]
     model = DispositionNext(**extract_dnx_config(model_config))
     has_ema = "ema_state_dict" in ckpt
-    model.load_state_dict(ckpt["ema_state_dict"] if (use_ema and has_ema) else ckpt["model_state_dict"])
+    state = ckpt["ema_state_dict"] if (use_ema and has_ema) else ckpt["model_state_dict"]
+    model.load_state_dict(upgrade_dnx_state(state, model))
     model.eval().to(device)
     f1 = ckpt.get("val_peak_f1_2")
     revision = hub_revision(path)
+    weights = "ema" if (use_ema and has_ema) else "raw"
+    data_config = ckpt.get("data_config", {})
+    provenance = {
+        "checkpoint": str(checkpoint),
+        "checkpoint_revision": revision,
+        "weights": weights,
+        "epoch": ckpt.get("epoch"),
+        "model_hash": model_hash(path, model_config, data_config, use_ema and has_ema),
+    }
     print(
         f"Head: {checkpoint}" + (f" @ {revision[:7]}" if revision else "")
-        + f", {'EMA' if (use_ema and has_ema) else 'raw'} weights, epoch {ckpt.get('epoch', '?')}"
+        + f", {'EMA' if weights == 'ema' else 'raw'} weights, epoch {ckpt.get('epoch', '?')}"
         + (f", val peak F1@2 {f1:.4f}" if isinstance(f1, float) else "")
+        + f", sha {provenance['model_hash'][:12]}"
     )
-    return model, model_config, ckpt.get("data_config", {})
+    return model, model_config, data_config, provenance
 
 
 def resolve_pooling_for_head(model: DispositionNext) -> str:

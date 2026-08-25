@@ -32,6 +32,23 @@ def extract_dnx_config(config: dict[str, object]) -> dict[str, object]:
     return {key: config[key] for key in DNX_CONFIG_KEYS if key in config}
 
 
+# Buffers introduced after checkpoints already existed. Filled from the live
+# model rather than from a hardcoded zero, so a head that sets one keeps it.
+LEGACY_ABSENT_BUFFERS = ("token_dc",)
+
+
+def upgrade_dnx_state(
+    state: dict[str, torch.Tensor], model: "DispositionNext",
+) -> dict[str, torch.Tensor]:
+    """Add buffers a checkpoint predates so `load_state_dict` can stay strict."""
+    upgraded = dict(state)
+    model_state = model.state_dict()
+    for name in LEGACY_ABSENT_BUFFERS:
+        if name not in upgraded and name in model_state:
+            upgraded[name] = model_state[name].detach().clone()
+    return upgraded
+
+
 class SlotProjector(nn.Module):
     """doc02: concat PxD -> Linear -> LayerNorm -> GELU -> Dropout.
 
@@ -276,6 +293,12 @@ class DispositionNext(nn.Module):
         self.use_periodicity = use_periodicity
         self.n_pool_tokens = n_pool_tokens
 
+        # Frozen V-JEPA 2.1 tokens carry a large constant offset; only ~10% of a
+        # token varies with time. Per pooled token, not one shared vector -- the
+        # pooling pyramid's cells sit at systematically different offsets. Rides in
+        # the checkpoint, so inference needs no flag. Zeros = pre-DC behaviour.
+        self.register_buffer("token_dc", torch.zeros(n_pool_tokens, backbone_hidden_dim))
+
         self.slot_projector = SlotProjector(backbone_hidden_dim, d_model, dropout, n_pool_tokens)
         if use_periodicity:
             # P1-B ablation (doc07 step 6) needs this structural, not just a
@@ -339,6 +362,8 @@ class DispositionNext(nn.Module):
             if valid.shape[1] != 2 * s:
                 raise ValueError(f"valid must be frame-level [B, 2*S]; got {tuple(valid.shape)} for S={s}")
             slot_valid = valid.view(b, s, 2).any(dim=-1)
+
+        tokens = tokens - self.token_dc.to(tokens.dtype)
 
         e = self.slot_projector(tokens)  # [B, S, d_model]
         if self.use_periodicity:

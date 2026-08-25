@@ -57,6 +57,11 @@ def _fingerprint_backbone(geometry: Any) -> str:
             raw = f"{geometry.backbone_id}|{wstat.st_size}|{int(wstat.st_mtime)}"
         else:
             raw = str(geometry.backbone_id)
+    # A non-default 2.1 window produces genuinely different features from the
+    # same weights. Empty for the default, so no existing cache is orphaned.
+    from src.backbone import window_cache_tag
+
+    raw += window_cache_tag(getattr(geometry, "window", None), getattr(geometry, "family", None))
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 

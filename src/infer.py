@@ -1,4 +1,5 @@
-"""Sliding-window head inference over pooled tokens, plus post-decode filters."""
+"""Sliding-window head inference over pooled tokens, plus the hold gate and
+confidence axes derived from the decoded distribution."""
 
 from __future__ import annotations
 
@@ -197,30 +198,6 @@ def sliding_window_predict_dnx(
     position = decode_blended_positions(probs_blend, n_bins, decode, decode_radius)
     activity = act_sum / weight_sum
     return position, activity, blend_moments(probs_blend, n_bins, decode_radius)
-
-
-def smooth_positions(position: np.ndarray, mode: str, window: int, polyorder: int = 2) -> np.ndarray:
-    """Post-decode temporal smoothing. 'median' removes single-frame direction
-    reversals at some cost in amplitude; 'savgol' is gentler."""
-    if mode == "none" or window <= 1:
-        return position
-    if mode == "median":
-        from scipy.signal import medfilt
-
-        if window % 2 == 0:
-            window += 1
-        return medfilt(position.astype(np.float64), window)
-    if mode == "savgol":
-        from scipy.signal import savgol_filter
-
-        if window % 2 == 0:
-            window += 1
-        if window <= polyorder:
-            window = polyorder + 1 + (polyorder % 2)
-        if len(position) < window:
-            return position
-        return np.clip(savgol_filter(position.astype(np.float64), window, polyorder), 0.0, 1.0)
-    raise ValueError(f"Unknown smoothing mode: {mode}")
 
 
 def apply_hold_gate(

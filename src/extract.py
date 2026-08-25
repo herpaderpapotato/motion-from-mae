@@ -250,6 +250,7 @@ def extract_video_tokens(
     preprocess: bool = False,
     preprocess_dir: Path | None = None,
     backbone_img_size: int | None = None,
+    backbone_window: int | None = None,
     compile_model: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Returns (tokens [S, P, D] float16, frame_idx [T] int32 relative to
@@ -261,7 +262,9 @@ def extract_video_tokens(
     the head different features."""
     if model is None:
         with step(f"loading backbone {backbone_id}", show_progress):
-            model, geometry = load_backbone(backbone_id, device=device, img_size=backbone_img_size)
+            model, geometry = load_backbone(
+                backbone_id, device=device, img_size=backbone_img_size, window=backbone_window,
+            )
         if compile_model:
             compile_backbone(model)
 

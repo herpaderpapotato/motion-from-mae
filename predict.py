@@ -6,7 +6,11 @@
     python predict.py                   # file/folder picker
 
 Defaults to the published head (herpaderpapotato/motion_from_mae_alt), which names its
-own backbone; both are pulled from the HF cache on first use. CUDA required.
+own backbone (override with --backbone); both are pulled from the HF cache on first
+use. CUDA required.
+
+Output is simplified to keyframes by default and the dense per-frame track is kept
+beside it as <name>.raw.funscript; --no-simplify writes the dense track alone.
 """
 
 import argparse
@@ -44,44 +48,67 @@ from src.infer import (
     apply_hold_gate,
     confidence_axes,
     sliding_window_predict_dnx,
-    smooth_positions,
 )
 from src.preprocess import DEFAULT_PREPROCESS_DIR
 from src.progress import human_duration, step
+from src.simplify import (
+    EXTREMA_PROMINENCE_FRAC,
+    MAX_ERR,
+    MIN_AMPLITUDE,
+    MIN_FRAMES,
+    MIN_GAP_MS,
+    SMOOTH_WINDOW_S,
+    reconstruction_stats,
+    simplify,
+)
 from src.token_cache import DEFAULT_CACHE_DIR
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 FRAME_VIEWS = ("auto", "crop", "full")
+RAW_TAG = ".raw"
 
 
-def non_colliding_path(path: Path, max_tries: int = 1000) -> Path:
+def raw_path_for(path: Path) -> Path:
+    """The dense sidecar beside a simplified script: name.funscript ->
+    name.raw.funscript, name.001.funscript -> name.001.raw.funscript."""
+    return path.with_name(path.stem + RAW_TAG + path.suffix)
+
+
+def non_colliding_path(path: Path, companions: tuple = (), max_tries: int = 1000) -> Path:
     """`path` if free, else <stem>.### with the first unused number.
 
     Runs are cheap to repeat and expensive to lose, so a second run never
-    overwrites the first one's funscript.
+    overwrites the first one's funscript. A number is only free when the files
+    `companions` derive from it are free too, so the raw sidecar keeps the same
+    number as the script it belongs to.
     """
-    if not path.exists():
+    def free(candidate: Path) -> bool:
+        return not candidate.exists() and not any(c(candidate).exists() for c in companions)
+
+    if free(path):
         return path
     for n in range(1, max_tries):
         candidate = path.with_name(f"{path.stem}.{n:03d}{path.suffix}")
-        if not candidate.exists():
+        if free(candidate):
             return candidate
     raise RuntimeError(f"no free filename for {path} after {max_tries} tries")
 
 
-def collect_videos(target: Path, exclude_dirs: tuple[Path, ...] = ()) -> list[Path]:
+def collect_videos(target: Path, exclude_dirs: tuple[Path, ...] = (),
+                   include_scripted: bool = False) -> list[Path]:
     """Videos to process. A folder is searched recursively; a named file is always kept.
 
     Folder search skips anything already scripted -- a batch is meant to be
-    re-runnable over a growing library without redoing finished work -- and
+    re-runnable over a growing library without redoing finished work, and
+    `include_scripted` (--force/--overwrite) is how you ask for a redo -- and
     anything under `exclude_dirs`, which are our own caches of generated clips.
     """
     if not target.is_dir():
         return [target]
     excluded = [d.resolve() for d in exclude_dirs if d.is_dir()]
     return [v for v in sorted(target.rglob("*.mp4"))
-            if not v.with_suffix(".funscript").exists()
+            if (include_scripted or not v.with_suffix(".funscript").exists())
             and not any(v.resolve().is_relative_to(d) for d in excluded)]
 
 
@@ -141,18 +168,19 @@ def pick_target() -> Path | None:
 # --------------------------------------------------------------------------- #
 
 def process(video: Path, out: Path | None, args: argparse.Namespace, model, data_cfg: dict,
-            device: torch.device, pooling, crop_box, frame_view: str,
-            backbone=None, geometry=None) -> str:
+            device: torch.device, pooling, crop_box, frame_view: str, backbone_id: str,
+            model_meta: dict, backbone=None, geometry=None) -> str:
     """Predict one video and write its funscript. Returns a one-line status."""
     verbose = not args.no_progress
     tokens, frame_idx, meta = extract_video_tokens(
-        video, data_cfg["backbone_id"], device, args.vr, args.sbs_crop,
+        video, backbone_id, device, args.vr, args.sbs_crop,
         args.start_time, args.duration,
         model=backbone, geometry=geometry,
         use_cache=args.token_cache, cache_dir=args.token_cache_dir,
         show_progress=verbose, crop_box=crop_box, pooling=pooling,
         preprocess=args.preprocess, preprocess_dir=args.preprocess_dir,
         backbone_img_size=data_cfg.get("backbone_img_size"),
+        backbone_window=data_cfg.get("backbone_window"),
         compile_model=args.compile and backbone is None,
     )
     feature_fps = float(meta["feature_fps"])
@@ -176,13 +204,6 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
             position, activity, feature_fps,
             activity_threshold=args.hold_gate_threshold, min_run_s=args.hold_gate_min_duration,
         )
-
-    smooth_window = None
-    if args.dnx_smooth != "none":
-        smooth_window = args.dnx_smooth_window or (3 if args.dnx_smooth == "median" else 5)
-        position = smooth_positions(position, args.dnx_smooth, smooth_window, args.dnx_smooth_polyorder)
-        if verbose:
-            print(f"  smoothing: {args.dnx_smooth} w={smooth_window}")
 
     if verbose:
         print(f"  head: {len(position)} frames in {time.perf_counter() - t0:.2f}s, "
@@ -237,25 +258,79 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
                 st.note(f"{len(times)} frames, measured {measured:.4f} fps "
                         f"(declared {feature_fps:.4f})" + (", cached" if from_cache else ""))
 
-    out_path = non_colliding_path(out or video.with_suffix(".funscript"))
-    funscript = predictions_to_funscript(
-        position, fps=feature_fps, start_time=args.start_time, frame_times=frame_times,
-        axes=axes,
-        metadata={
-            "timing": "source_pts" if frame_times is not None else "uniform_fps",
-            "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
-            "output_fps": feature_fps, "start_time_seconds": args.start_time,
-            "hold_gate": args.hold_gate,
-            "crop_slots": crop_slots, "stride_slots": stride_slots,
-            "smooth": args.dnx_smooth, "smooth_window": smooth_window,
-            "frame_view": frame_view, "pooling": pooling, "decode": args.decode,
-            "decode_radius": args.decode_radius if args.decode == "mode" else None,
-        },
-    )
+    # Both variants are written from explicit per-frame times so the simplified
+    # one keeps the timestamps of the frames it kept, not a re-indexed grid.
+    timing = "source_pts" if frame_times is not None else "uniform_fps"
+    if frame_times is None:
+        frame_times = np.arange(len(position), dtype=np.float64) / feature_fps + args.start_time
+
+    metadata = {
+        "timing": timing,
+        "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
+        "output_fps": feature_fps, "start_time_seconds": args.start_time,
+        "hold_gate": args.hold_gate,
+        "crop_slots": crop_slots, "stride_slots": stride_slots,
+        "frame_view": frame_view, "pooling": pooling, "decode": args.decode,
+        "decode_radius": args.decode_radius if args.decode == "mode" else None,
+        **model_meta,
+    }
+
+    simplifying = args.simplify and len(position) >= MIN_FRAMES
+    out_path = out or video.with_suffix(".funscript")
+    if not args.overwrite:
+        out_path = non_colliding_path(out_path, companions=(raw_path_for,) if simplifying else ())
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as fh:
-        json.dump(funscript, fh)
+
+    def write(path: Path, positions, times, ax, extra: dict) -> dict:
+        script = predictions_to_funscript(
+            positions, fps=feature_fps, start_time=args.start_time, frame_times=times,
+            axes=ax, metadata={**metadata, **extra})
+        with open(path, "w") as fh:
+            json.dump(script, fh)
+        return script
+
+    if not simplifying:
+        extra = {"variant": "dense"}
+        if args.simplify:  # asked for, but there is nothing to simplify
+            extra["simplification"] = {"applied": False,
+                                       "reason": f"only {len(position)} frames"}
+        funscript = write(out_path, position, frame_times, axes, extra)
+    else:
+        # Simplify the quantised track the raw file holds, so the reported error
+        # is between the two files that actually get written.
+        dense = np.clip(np.rint(position * 100.0), 0.0, 100.0)
+        t_s = time.perf_counter()
+        kept = simplify(dense, feature_fps, max_err=args.simplify_max_err,
+                        min_amp=args.simplify_min_amp, min_gap_ms=args.simplify_min_gap_ms)
+        stats = reconstruction_stats(dense, kept)
+        if verbose:
+            print(f"  simplify: {len(dense)} -> {len(kept)} actions "
+                  f"({100 * stats['kept_fraction']:.1f}%), linear error mean "
+                  f"{stats['linear_error']['mean']:.2f} max {stats['linear_error']['max']:.2f} "
+                  f"[{time.perf_counter() - t_s:.1f}s]")
+
+        raw_path = raw_path_for(out_path)
+        write(raw_path, position, frame_times, axes,
+              {"variant": "dense", "simplification": {"applied": False,
+                                                      "simplified_file": out_path.name}})
+        sub_axes = ({k: {**v, "values": v["values"][kept]} for k, v in axes.items()}
+                    if axes else None)
+        funscript = write(
+            out_path, dense[kept] / 100.0, frame_times[kept], sub_axes,
+            {"variant": "simplified",
+             "simplification": {
+                 "applied": True,
+                 "method": "savgol -> extrema -> greedy pchip -> device pass",
+                 "params": {"max_err": args.simplify_max_err, "min_amp": args.simplify_min_amp,
+                            "min_gap_ms": args.simplify_min_gap_ms,
+                            "smooth_window_s": SMOOTH_WINDOW_S,
+                            "prominence_frac": EXTREMA_PROMINENCE_FRAC},
+                 "raw_file": raw_path.name,
+                 **stats}})
+
     status = f"-> {out_path} ({len(funscript['actions'])} actions"
+    if simplifying:
+        status += f" from {len(position)}, raw -> {raw_path.name}"
     status += f", axes {'+'.join(a['id'] for a in funscript['axes'])})" if axes else ")"
 
     if args.save_activity:
@@ -278,8 +353,17 @@ def main() -> None:
     parser.add_argument("--checkpoint-revision", type=str, default=None,
                         help="Pin the HF head to a commit sha or tag (default: the hub's "
                              "current revision, re-checked every run)")
+    parser.add_argument("--backbone", type=str, default=None,
+                        help="Backbone HF repo id or local path, overriding the one the head "
+                             "names in its data_config")
     parser.add_argument("--out", type=Path, default=None,
                         help="Output funscript path (default: <video>.funscript). Single video only")
+    parser.add_argument("--force", action="store_true",
+                        help="Folder mode: also process videos that already have a funscript, "
+                             "writing a new numbered one beside the old")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Replace an existing funscript instead of numbering around it. "
+                             "Implies --force")
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--vr", dest="vr", action="store_true", default=True,
@@ -308,7 +392,7 @@ def main() -> None:
     parser.add_argument("--hold-gate-min-duration", type=float, default=HOLD_GATE_MIN_RUN_S,
                         help="Minimum sustained-low-activity duration in seconds")
     parser.add_argument("--save-activity", action="store_true", help="Write a sidecar .activity.npy")
-    parser.add_argument("--confidence-axes", dest="confidence_axes", action="store_true", default=True,
+    parser.add_argument("--confidence-axes", dest="confidence_axes", action="store_true", default=False,
                         help="Write confidence as extra funscript axes C1 (speed-corrected "
                              "sharpness), C2 "
                              "(decode agreement) and C3 (per-stroke aggregate), 0-100 like pos, "
@@ -320,11 +404,6 @@ def main() -> None:
                         help=f"Head window length in slots (default {CROP_SLOTS} = {CROP_SLOTS * 2} frames)")
     parser.add_argument("--dnx-stride", type=int, default=None,
                         help="Head window stride in slots (default: half the window)")
-    parser.add_argument("--dnx-smooth", choices=["none", "median", "savgol"], default="none",
-                        help="Post-decode temporal smoothing")
-    parser.add_argument("--dnx-smooth-window", type=int, default=None,
-                        help="Smoothing window in frames (odd; default 3 median / 5 savgol)")
-    parser.add_argument("--dnx-smooth-polyorder", type=int, default=2, help="--dnx-smooth savgol only")
     parser.add_argument("--use-raw-weights", action="store_true",
                         help="Use raw (non-EMA) weights instead of EMA")
     parser.add_argument("--decode", choices=list(DECODE_MODES), default="expectation",
@@ -333,6 +412,20 @@ def main() -> None:
                              "the peak. Decode-time only")
     parser.add_argument("--decode-radius", type=int, default=HLGAUSS_MODE_RADIUS,
                         help="--decode mode only: half-width in bins; 0 is a plain argmax")
+
+    parser.add_argument("--simplify", dest="simplify", action="store_true", default=True,
+                        help="Reduce the per-frame track to keyframes (savgol, extrema seed, "
+                             "greedy pchip refine, device pass) and keep the dense track as "
+                             "<name>.raw.funscript")
+    parser.add_argument("--no-simplify", dest="simplify", action="store_false",
+                        help="Write the dense per-frame track only, with no .raw sidecar")
+    parser.add_argument("--simplify-max-err", type=float, default=MAX_ERR,
+                        help="Greedy pchip error budget in 0-100 position units: no frame ends "
+                             "up further than this from the dense track")
+    parser.add_argument("--simplify-min-amp", type=float, default=MIN_AMPLITUDE,
+                        help="Drop strokes smaller than this (0-100), which a device cannot render")
+    parser.add_argument("--simplify-min-gap-ms", type=float, default=MIN_GAP_MS,
+                        help="Minimum spacing between kept actions")
 
     parser.add_argument("--token-cache", dest="token_cache", action="store_true", default=True,
                         help="Cache/resume extracted tokens, and the source probe "
@@ -370,9 +463,11 @@ def main() -> None:
     if not target.exists():
         parser.error(f"not found: {target}")
 
-    videos = collect_videos(target, exclude_dirs=(args.preprocess_dir, args.token_cache_dir))
+    redo = args.force or args.overwrite
+    videos = collect_videos(target, exclude_dirs=(args.preprocess_dir, args.token_cache_dir),
+                            include_scripted=redo)
     if not videos:
-        print(f"no unscripted .mp4 under {target}")
+        print(f"no {'' if redo else 'unscripted '}.mp4 under {target}")
         return
     if args.out is not None and len(videos) > 1:
         parser.error(f"--out takes a single video, but {len(videos)} were found under {target}")
@@ -392,7 +487,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     print(f"Device: {device} ({torch.cuda.get_device_name(device)})")
 
-    model, model_cfg, data_cfg = load_dnx_model(
+    model, model_cfg, data_cfg, provenance = load_dnx_model(
         args.checkpoint, device, use_ema=not args.use_raw_weights,
         revision=args.checkpoint_revision)
     frame_view = args.frame_view
@@ -405,14 +500,20 @@ def main() -> None:
     # Load the backbone ONCE for the whole batch. Extraction would otherwise
     # resolve the hub repo, rebuild it and re-pay the torch.compile cost per
     # video -- the repeated "Fetching N files" and the long silent start.
-    backbone_id = data_cfg["backbone_id"]
+    backbone_id = args.backbone or data_cfg["backbone_id"]
     verbose = not args.no_progress
     with step(f"Loading backbone {backbone_id}", verbose, indent="") as st:
         backbone, geometry = load_backbone(
-            backbone_id, device=device, img_size=data_cfg.get("backbone_img_size"))
+            backbone_id, device=device, img_size=data_cfg.get("backbone_img_size"),
+            window=data_cfg.get("backbone_window"))
         rev = geometry.backbone_revision
         st.note((f"{rev[:7]}, " if rev else "")
-                + f"{geometry.slug}, {geometry.window}-frame windows @ {geometry.resize[0]}px")
+                + f"{geometry.slug}, {geometry.window}-frame windows @ {geometry.resize[0]}px"
+                + (" (--backbone override)" if args.backbone else ""))
+    # Provenance for every funscript written this run: which head, which weights
+    # inside it, and which backbone produced the features.
+    model_meta = {**provenance, "backbone_id": geometry.backbone_id,
+                  "backbone_revision": geometry.backbone_revision}
     if args.compile:
         with step("Compiling backbone blocks (one-off)", verbose, indent=""):
             compile_backbone(backbone)
@@ -421,7 +522,9 @@ def main() -> None:
     print(f"Settings: frame_view={frame_view} pooling={pooling} decode={args.decode} "
           f"vr={'on (' + args.sbs_crop + ' eye)' if args.vr else 'off'} "
           f"preprocess={'on' if args.preprocess else 'off'} "
-          f"token_cache={'on' if args.token_cache else 'off'}")
+          f"token_cache={'on' if args.token_cache else 'off'} "
+          f"simplify={'on' if args.simplify else 'off'}"
+          + (" overwrite" if args.overwrite else (" force" if args.force else "")))
     print(f"\n{len(videos)} video(s) to process under {target}")
 
     t0 = time.perf_counter()
@@ -431,7 +534,8 @@ def main() -> None:
         t_video = time.perf_counter()
         try:
             status = process(video, args.out, args, model, data_cfg, device,
-                             pooling, crop_box, frame_view, backbone=backbone, geometry=geometry)
+                             pooling, crop_box, frame_view, backbone_id, model_meta,
+                             backbone=backbone, geometry=geometry)
         except Exception as exc:  # keep going through a batch
             status = f"FAILED: {type(exc).__name__}: {exc}"
             failed += 1
