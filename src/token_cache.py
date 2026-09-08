@@ -94,11 +94,13 @@ def cache_path_for_video(
     # filenames stay a stable, parseable shape.
     fps_tag = "native"
     range_tag = f"f{start_frame}-{end_frame}"
-    # crop vs full-eye framing changes the tokens (doc03 centre-bottom crop
-    # vs the whole eye), so it must be part of the cache identity -- otherwise
-    # a crop run and a full-frame run on the same video/backbone would
+    # Framing changes the tokens (doc03 centre-bottom crop vs the whole eye vs a
+    # --crop-box of your own), so it must be part of the cache identity --
+    # otherwise runs with different framing on the same video/backbone would
     # silently share (and corrupt) one cache entry.
-    view_tag = "full" if crop_box is not None else "crop"
+    from src.backbone import crop_box_tag
+
+    view_tag = crop_box_tag(crop_box)
     # Constant: this repo always decodes at native resolution. Kept in the name
     # so cache files stay interchangeable with the training repo's.
     size_tag = "srcnative"

@@ -26,8 +26,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.backbone import (
+    CROP_BOX,
     FULL_FRAME_CROP_BOX,
     compile_backbone,
+    crop_box_tag,
     load_backbone,
     warmup_backbone,
 )
@@ -67,6 +69,22 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 FRAME_VIEWS = ("auto", "crop", "full")
 RAW_TAG = ".raw"
+
+
+def parse_crop_box(text: str) -> tuple[float, float, float, float]:
+    """"x1,y1,x2,y2" as fractions of the (already SBS-cropped) eye."""
+    parts = [p for p in text.replace(" ", "").split(",") if p]
+    try:
+        values = tuple(float(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number in {text!r}")
+    if len(values) != 4:
+        raise argparse.ArgumentTypeError(f"expected four comma-separated values, got {len(values)}")
+    x1, y1, x2, y2 = values
+    if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"need 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1, got {text!r}")
+    return values
 
 
 def raw_path_for(path: Path) -> Path:
@@ -270,7 +288,9 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
         "output_fps": feature_fps, "start_time_seconds": args.start_time,
         "hold_gate": args.hold_gate,
         "crop_slots": crop_slots, "stride_slots": stride_slots,
-        "frame_view": frame_view, "pooling": pooling, "decode": args.decode,
+        "frame_view": frame_view,
+        "crop_box": list(crop_box if crop_box is not None else CROP_BOX),
+        "pooling": pooling, "decode": args.decode,
         "decode_radius": args.decode_radius if args.decode == "mode" else None,
         **model_meta,
     }
@@ -375,6 +395,11 @@ def main() -> None:
                         help="Spatial framing fed to the backbone: 'crop' is the centre-bottom "
                              "crop, 'full' the whole eye. 'auto' follows the checkpoint's "
                              "data_config['frame_mode']")
+    parser.add_argument("--crop-box", type=parse_crop_box, default=None, metavar="X1,Y1,X2,Y2",
+                        help="Override --frame-view with an explicit box, as fractions of the "
+                             f"eye. The 'crop' view is {','.join(f'{v:.4f}' for v in CROP_BOX)} "
+                             "and 'full' is 0,0,1,1. Caches (tokens and --preprocess clips) are "
+                             "keyed by the box, so each one is built once and reused")
 
     parser.add_argument("--timing", choices=["source-pts", "nominal-fps"], default="source-pts",
                         help="Where action timestamps come from: the source's own per-frame "
@@ -490,11 +515,15 @@ def main() -> None:
     model, model_cfg, data_cfg, provenance = load_dnx_model(
         args.checkpoint, device, use_ema=not args.use_raw_weights,
         revision=args.checkpoint_revision)
-    frame_view = args.frame_view
-    if frame_view == "auto":
-        frame_view = "full" if data_cfg.get("frame_mode") == "full" else "crop"
-    use_full_frame = frame_view == "full"
-    crop_box = FULL_FRAME_CROP_BOX if use_full_frame else None
+    if args.crop_box is not None:
+        crop_box = args.crop_box
+        tag = crop_box_tag(crop_box)
+        frame_view = tag if tag in ("crop", "full") else "custom"
+    else:
+        frame_view = args.frame_view
+        if frame_view == "auto":
+            frame_view = "full" if data_cfg.get("frame_mode") == "full" else "crop"
+        crop_box = FULL_FRAME_CROP_BOX if frame_view == "full" else None
     pooling = resolve_pooling_for_head(model)
 
     # Load the backbone ONCE for the whole batch. Extraction would otherwise
@@ -519,7 +548,9 @@ def main() -> None:
             compile_backbone(backbone)
             warmup_backbone(backbone, geometry, device)
 
-    print(f"Settings: frame_view={frame_view} pooling={pooling} decode={args.decode} "
+    box_note = ("" if frame_view != "custom"
+                else "(" + ",".join(f"{v:g}" for v in crop_box) + ") ")
+    print(f"Settings: frame_view={frame_view} {box_note}pooling={pooling} decode={args.decode} "
           f"vr={'on (' + args.sbs_crop + ' eye)' if args.vr else 'off'} "
           f"preprocess={'on' if args.preprocess else 'off'} "
           f"token_cache={'on' if args.token_cache else 'off'} "

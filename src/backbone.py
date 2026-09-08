@@ -38,6 +38,22 @@ POOLING_LAYOUTS: dict[str, tuple[int, ...]] = {
 DEFAULT_POOLING = "quadrants"
 
 
+def crop_box_tag(crop_box: tuple[float, float, float, float] | None) -> str:
+    """Stable filename-safe identity for a framing.
+
+    None means CROP_BOX. The two built-in boxes keep the historical "crop"/"full"
+    tags so caches written before --crop-box stay reusable; anything else gets its
+    own tag from the box itself (ten-thousandths, so two boxes share a cache only
+    when they crop the same pixels).
+    """
+    if crop_box is None or tuple(crop_box) == CROP_BOX:
+        return "crop"
+    if tuple(crop_box) == FULL_FRAME_CROP_BOX:
+        return "full"
+    return "box" + "-".join(f"{int(round(v * 10000)):05d}" for v in crop_box)
+
+
+
 def pooling_num_tokens(pooling: str = DEFAULT_POOLING) -> int:
     return sum(k * k for k in resolve_pooling(pooling))
 

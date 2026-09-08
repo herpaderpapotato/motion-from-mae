@@ -31,6 +31,11 @@ runs at whatever resolution the head was trained on, taken from its
 `data_config['backbone_img_size']` — without that a head trained on 384 tokens would
 be served the release default instead.
 
+`--crop-box x1,y1,x2,y2` replaces `--frame-view` with an explicit box in fractions of
+the eye (`crop` is `0.1667,0.3333,0.8333,1`, `full` is `0,0,1,1`). The box is part of
+the token- and preprocess-cache identity, so each framing is extracted once and every
+later run with the same box reuses it.
+
 `--preprocess` bakes the eye crop, the frame-view crop and the resize into a cached
 clip at the backbone's own input size (224 or 384) with ffmpeg + NVDEC
 (`data/video_preprocess_cache/`, `--preprocess-dir` to move). Decoding an 8K source is
