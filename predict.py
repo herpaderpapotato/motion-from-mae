@@ -258,6 +258,18 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
                                 "min_distance_s": STROKE_MIN_DISTANCE_S, "calibrated": False}},
         }
 
+    # After the confidence axes: their stroke prominence is an absolute threshold
+    # on the model's own scale.
+    normalization = None
+    if args.normalize:
+        lo, hi = float(position.min()), float(position.max())
+        normalization = {"applied": hi > lo, "source_min": lo, "source_max": hi}
+        if hi > lo:
+            position = (position - lo) / (hi - lo)
+        if verbose:
+            print(f"  normalize: [{lo:.3f}, {hi:.3f}] -> [0, 1]"
+                  + ("" if hi > lo else " skipped, flat track"))
+
     # Action times come from the source's own frame timestamps; a stream whose
     # declared rate isn't its real one drifts the whole script otherwise.
     start_frame = int(round(args.start_time * feature_fps))
@@ -287,6 +299,7 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
         "creator": "VideoToMotion", "type": "basic", "model": "disposition_next",
         "output_fps": feature_fps, "start_time_seconds": args.start_time,
         "hold_gate": args.hold_gate,
+        "normalize": normalization,
         "crop_slots": crop_slots, "stride_slots": stride_slots,
         "frame_view": frame_view,
         "crop_box": list(crop_box if crop_box is not None else CROP_BOX),
@@ -416,6 +429,9 @@ def main() -> None:
     parser.add_argument("--hold-gate-threshold", type=float, default=HOLD_GATE_ACTIVITY_THRESHOLD)
     parser.add_argument("--hold-gate-min-duration", type=float, default=HOLD_GATE_MIN_RUN_S,
                         help="Minimum sustained-low-activity duration in seconds")
+    parser.add_argument("--normalize", action="store_true",
+                        help="Min-max rescale the predicted track to span 0-100 before it is "
+                             "written and simplified (applies to the .raw sidecar too)")
     parser.add_argument("--save-activity", action="store_true", help="Write a sidecar .activity.npy")
     parser.add_argument("--confidence-axes", dest="confidence_axes", action="store_true", default=False,
                         help="Write confidence as extra funscript axes C1 (speed-corrected "
@@ -554,7 +570,8 @@ def main() -> None:
           f"vr={'on (' + args.sbs_crop + ' eye)' if args.vr else 'off'} "
           f"preprocess={'on' if args.preprocess else 'off'} "
           f"token_cache={'on' if args.token_cache else 'off'} "
-          f"simplify={'on' if args.simplify else 'off'}"
+          f"simplify={'on' if args.simplify else 'off'} "
+          f"normalize={'on' if args.normalize else 'off'}"
           + (" overwrite" if args.overwrite else (" force" if args.force else "")))
     print(f"\n{len(videos)} video(s) to process under {target}")
 
