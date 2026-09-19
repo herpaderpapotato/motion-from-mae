@@ -107,6 +107,18 @@ def load_dnx_model(
     return model, model_config, data_config, provenance
 
 
+def resolve_interleave_for_head(model: DispositionNext, data_cfg: dict | None = None) -> bool:
+    """interleave_input from the head's frames_per_slot, cross-checked against data_config."""
+    derived = model.frames_per_slot == 1
+    declared = (data_cfg or {}).get("interleave_input")
+    if declared is not None and bool(declared) != derived:
+        raise SystemExit(
+            f"checkpoint is inconsistent: data_config records interleave_input={declared} but the head "
+            f"predicts {model.frames_per_slot} frame(s) per slot."
+        )
+    return derived
+
+
 def resolve_pooling_for_head(model: DispositionNext) -> str:
     """The head's own projector width decides the pooling layout -- it is what
     actually rejects a mismatched token pack."""

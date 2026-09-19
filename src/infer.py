@@ -146,14 +146,15 @@ def sliding_window_predict_dnx(
     PROBABILITY space (not decoded scalars), renormalised, then decoded.
     Activity is blended the same way in sigmoid space.
 
-    Returns (position [T], activity [T], moments), T = 2 * n_slots. `moments`
+    Returns (position [T], activity [T], moments), T = frames_per_slot * n_slots. `moments`
     holds the raw per-frame uncertainty of the same blended distribution the
     position is decoded from (see `blend_moments`), so it costs nothing extra;
     `confidence_axes` scales it for display.
     """
     s = tokens.shape[0]
     n_bins = model.n_bins
-    t_feat = s * 2
+    fps = model.frames_per_slot
+    t_feat = s * fps
     stride = max(1, int(round(crop_slots * (1 - overlap))))
 
     prob_sum = np.zeros((t_feat, n_bins), dtype=np.float64)
@@ -167,7 +168,7 @@ def sliding_window_predict_dnx(
         if starts[-1] + crop_slots < s:
             starts.append(s - crop_slots)
 
-    bartlett_frame = np.bartlett(max(2, crop_slots * 2)).astype(np.float64) + 0.01
+    bartlett_frame = np.bartlett(max(2, crop_slots * fps)).astype(np.float64) + 0.01
 
     with torch.no_grad():
         for start in starts:
@@ -175,8 +176,8 @@ def sliding_window_predict_dnx(
             n_slots = end - start
             window = np.zeros((crop_slots, tokens.shape[1], tokens.shape[-1]), dtype=np.float32)
             window[:n_slots] = tokens[start:end]
-            valid = np.zeros(crop_slots * 2, dtype=bool)
-            valid[:n_slots * 2] = True
+            valid = np.zeros(crop_slots * fps, dtype=bool)
+            valid[:n_slots * fps] = True
 
             tok_t = torch.from_numpy(window).unsqueeze(0).to(device, dtype=torch.float32)
             valid_t = torch.from_numpy(valid).unsqueeze(0).to(device, dtype=torch.bool)
@@ -185,9 +186,9 @@ def sliding_window_predict_dnx(
             probs = F.softmax(out["position_logits"][0].float(), dim=-1).cpu().numpy()
             act = torch.sigmoid(out["activity_logits"][0]).float().cpu().numpy()
 
-            n_frames = n_slots * 2
+            n_frames = n_slots * fps
             w = bartlett_frame[:n_frames]
-            t0 = start * 2
+            t0 = start * fps
             prob_sum[t0:t0 + n_frames] += probs[:n_frames] * w[:, None]
             act_sum[t0:t0 + n_frames] += act[:n_frames] * w
             weight_sum[t0:t0 + n_frames] += w

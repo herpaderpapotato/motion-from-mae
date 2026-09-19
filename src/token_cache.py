@@ -76,6 +76,7 @@ def cache_path_for_video(
     crop_box: tuple[float, float, float, float] | None = None,
     pooling: str | None = None,
     preprocess: bool = False,
+    interleave_input: bool = False,
 ) -> Path:
     """Cache identity includes the requested [start_frame, end_frame) source
     range, so a whole-video run (the common case -- no --start/--duration)
@@ -115,6 +116,10 @@ def cache_path_for_video(
     # torch one (~0.99 token correlation), so the two paths must not share a
     # cache entry. Empty when off, so existing cache files keep their names.
     pre_tag = "_pre" if preprocess else ""
+    if interleave_input:
+        from src.backbone import INTERLEAVE_CACHE_TAG
+
+        pool_tag += INTERLEAVE_CACHE_TAG
 
     def _sanitize(s: str, max_len: int) -> str:
         # geometry.slug is a short clean tag for HF-hub backbones, but for a

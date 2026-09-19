@@ -273,6 +273,29 @@ def load_backbone(
 VJEPA21_WINDOW_FRAMES = 64
 
 
+INTERLEAVE_FAMILIES = ("vjepa21",)
+INTERLEAVE_CACHE_TAG = "_il"
+
+
+def check_interleave_supported(geometry: BackboneGeometry) -> None:
+    if geometry.family not in INTERLEAVE_FAMILIES:
+        raise ValueError(
+            f"interleave_input is only supported for {INTERLEAVE_FAMILIES}, "
+            f"got family={geometry.family!r} ({geometry.backbone_id})"
+        )
+
+
+def interleave_frames(frames: torch.Tensor, next_frame: torch.Tensor | None = None) -> torch.Tensor:
+    """[N, ...] -> [2N, ...] ordered f0,f1, f1,f2, ..., f(N-1),next.
+
+    With a tubelet of 2, slot j then spans source frames (j, j+1). `next_frame`
+    ([1, ...]) is the successor of the last frame; None repeats the last frame.
+    """
+    nxt = frames[-1:] if next_frame is None else next_frame
+    successors = torch.cat([frames[1:], nxt], dim=0)
+    return torch.stack([frames, successors], dim=1).flatten(0, 1)
+
+
 def window_cache_tag(window: int | None, family: str | None = None) -> str:
     """Cache-identity suffix for a backbone window; empty for the default.
 

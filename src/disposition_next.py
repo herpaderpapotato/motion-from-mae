@@ -18,7 +18,7 @@ from src.hlgauss import HLGAUSS_N_BINS, hlgauss_decode
 DNX_CONFIG_KEYS = {
     "backbone_hidden_dim", "d_model", "n_layers", "n_heads", "mlp_ratio",
     "dropout", "periodicity_max_lag", "periodicity_dim", "n_bins",
-    "max_slots", "use_rope", "rope_base", "use_periodicity", "n_pool_tokens",
+    "max_slots", "use_rope", "rope_base", "use_periodicity", "n_pool_tokens", "frames_per_slot",
 }
 
 # Tokens per slot in the doc02/doc03 cache format (full mean + 4 quadrants).
@@ -261,9 +261,9 @@ class DispositionNext(nn.Module):
     size: the slot projector consumes 5*backbone_hidden_dim, so the same head
     works for any backbone candidate's token cache.
 
-    Input: tokens [B, S, P, D] (S = number of 2-frame slots, P =
+    Input: tokens [B, S, P, D] (S = number of slots, P =
     `n_pool_tokens`), valid [B, S] bool slot mask (padding). Output: per-frame
-    (2 per slot) position bin logits + activity logits + decoded position
+    (frames_per_slot per slot) position bin logits + activity logits + decoded position
     expectation.
     """
 
@@ -283,6 +283,7 @@ class DispositionNext(nn.Module):
         rope_base: float = 10000.0,
         use_periodicity: bool = True,
         n_pool_tokens: int = LEGACY_N_POOL_TOKENS,
+        frames_per_slot: int = 2,
     ):
         super().__init__()
         self.backbone_hidden_dim = backbone_hidden_dim
@@ -292,6 +293,10 @@ class DispositionNext(nn.Module):
         self.max_slots = max_slots
         self.use_periodicity = use_periodicity
         self.n_pool_tokens = n_pool_tokens
+        # 1 for interleave_input caches (slot j -> frame j), 2 for the legacy layout.
+        self.frames_per_slot = int(frames_per_slot)
+        if self.frames_per_slot not in (1, 2):
+            raise ValueError(f"frames_per_slot must be 1 or 2, got {frames_per_slot}")
 
         # Frozen V-JEPA 2.1 tokens carry a large constant offset; only ~10% of a
         # token varies with time. Per pooled token, not one shared vector -- the
@@ -331,14 +336,14 @@ class DispositionNext(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-        self.position_head = nn.Linear(d_model, 2 * n_bins)
-        self.activity_head = nn.Linear(d_model, 2)
+        self.position_head = nn.Linear(d_model, self.frames_per_slot * n_bins)
+        self.activity_head = nn.Linear(d_model, self.frames_per_slot)
 
     def forward(self, tokens: torch.Tensor, valid: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         """
         Args:
             tokens: [B, S, P, D].
-            valid: [B, 2*S] bool, **frame-level** (doc03's granularity, same
+            valid: [B, frames_per_slot*S] bool, **frame-level** (doc03's granularity, same
                 mask used for loss terms) -- NOT slot-level. A slot is treated
                 as valid internally (for attention masking) iff at least one
                 of its 2 frames is valid, matching doc03's slot-drop rule
@@ -359,9 +364,12 @@ class DispositionNext(nn.Module):
         if valid is None:
             slot_valid = torch.ones(b, s, dtype=torch.bool, device=tokens.device)
         else:
-            if valid.shape[1] != 2 * s:
-                raise ValueError(f"valid must be frame-level [B, 2*S]; got {tuple(valid.shape)} for S={s}")
-            slot_valid = valid.view(b, s, 2).any(dim=-1)
+            fps = self.frames_per_slot
+            if valid.shape[1] != fps * s:
+                raise ValueError(
+                    f"valid must be frame-level [B, {fps}*S]; got {tuple(valid.shape)} for S={s}"
+                )
+            slot_valid = valid.view(b, s, fps).any(dim=-1)
 
         tokens = tokens - self.token_dc.to(tokens.dtype)
 
@@ -384,8 +392,8 @@ class DispositionNext(nn.Module):
             x = block(x, cos, sin, slot_valid)
         x = self.final_norm(x)
 
-        pos_logits = self.position_head(x).reshape(b, s * 2, self.n_bins)  # slot s -> frames 2s, 2s+1
-        act_logits = self.activity_head(x).reshape(b, s * 2)
+        pos_logits = self.position_head(x).reshape(b, s * self.frames_per_slot, self.n_bins)
+        act_logits = self.activity_head(x).reshape(b, s * self.frames_per_slot)
         position = hlgauss_decode(pos_logits, self.n_bins)
 
         return {

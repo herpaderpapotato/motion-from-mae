@@ -19,9 +19,11 @@ from src.backbone import (
     CROP_BOX,
     DEFAULT_POOLING,
     FULL_FRAME_CROP_BOX,
+    check_interleave_supported,
     clip_tokens_from_frames,
     compile_backbone,
     crop_resize_normalize,
+    interleave_frames,
     load_backbone,
     pooling_num_tokens,
 )
@@ -126,7 +128,8 @@ def decoder_timebase(video_path: Path, cache_dir: Path | None = None) -> tuple[f
 
 
 def source_frame_times(video_path: Path, min_frames: int = 0,
-                       cache_dir: Path | None = None) -> tuple[np.ndarray | None, bool]:
+                       cache_dir: Path | None = None,
+                       media_path: Path | None = None) -> tuple[np.ndarray | None, bool]:
     """Every video frame's presentation time in seconds, from the container index.
 
     The funscript is played against the SOURCE, so its actions have to carry the
@@ -139,6 +142,7 @@ def source_frame_times(video_path: Path, min_frames: int = 0,
 
     Returns (times, from_cache); times is None if the table is unreadable or too
     short to cover the run, so the caller can fall back to the uniform grid.
+    Cached under `video_path`; `media_path` (a local copy) is what gets probed.
     """
     cache_path = source_cache_path(video_path, cache_dir) if cache_dir is not None else None
     cached = _read_source_cache(cache_path)
@@ -149,7 +153,8 @@ def source_frame_times(video_path: Path, min_frames: int = 0,
         try:
             out = subprocess.run(
                 ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video_path)],
+                 "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+                 str(media_path or video_path)],
                 capture_output=True, text=True, check=True,
             )
         except Exception:
@@ -168,6 +173,60 @@ def source_frame_times(video_path: Path, min_frames: int = 0,
     if len(times) < max(1, min_frames):
         return None, from_cache
     return times, from_cache
+
+
+def _frame_window(fps_src: float, total_frames: int, start_time: float | None,
+                  duration: float | None) -> tuple[int, int]:
+    start_frame = int(round((start_time or 0.0) * fps_src))
+    end_frame = total_frames if duration is None else min(total_frames, start_frame + int(round(duration * fps_src)))
+    return start_frame, end_frame
+
+
+def source_read_needed(
+    video_path: Path,
+    geometry,
+    vr_mode: bool,
+    sbs_crop: str,
+    start_time: float | None,
+    duration: float | None,
+    use_cache: bool,
+    cache_dir: Path | None,
+    crop_box: tuple[float, float, float, float] | None,
+    pooling: str | None,
+    preprocess: bool,
+    preprocess_dir: Path | None,
+    interleave_input: bool,
+    need_frame_times: bool,
+) -> bool:
+    """Whether `extract_video_tokens` plus `source_frame_times` with these settings
+    would read the source's media data rather than only its header."""
+    source_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR) if use_cache else None
+    if need_frame_times:
+        cached = _read_source_cache(
+            source_cache_path(video_path, source_cache_dir) if source_cache_dir else None)
+        if "pts" not in cached:
+            return True
+    fps_src, total_frames = decoder_timebase(video_path, cache_dir=source_cache_dir)
+    start_frame, end_frame = _frame_window(fps_src, total_frames, start_time, duration)
+    if use_cache:
+        slot_stride = 1 if interleave_input else geometry.frames_per_slot
+        expected = -(-max(0, end_frame - start_frame) // slot_stride)
+        path = cache_path_for_video(
+            Path(video_path), geometry, vr_mode, sbs_crop, start_frame, end_frame, cache_dir,
+            crop_box=crop_box, pooling=pooling or DEFAULT_POOLING, preprocess=preprocess,
+            interleave_input=interleave_input,
+        )
+        completed, total = ResumableTokenCache(path).load_progress()
+        if total == expected and completed >= expected > 0:
+            return False
+    if preprocess:
+        from src import preprocess as pp
+
+        return pp.cached_clip(
+            video_path, vr_mode, sbs_crop, crop_box if crop_box is not None else CROP_BOX,
+            geometry.resize, start_frame, end_frame, cache_dir=preprocess_dir,
+        ) is None
+    return True
 
 
 class EyeDecoder:
@@ -252,6 +311,8 @@ def extract_video_tokens(
     backbone_img_size: int | None = None,
     backbone_window: int | None = None,
     compile_model: bool = False,
+    interleave_input: bool = False,
+    media_path: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Returns (tokens [S, P, D] float16, frame_idx [T] int32 relative to
     start_time, metadata).
@@ -259,7 +320,14 @@ def extract_video_tokens(
     `backbone_img_size` comes from the head's `data_config` and applies to
     V-JEPA 2.1 only: it runs at any resolution (RoPE), so rebuilding it at the
     release default when the head was trained on another one would silently feed
-    the head different features."""
+    the head different features.
+
+    `interleave_input` feeds the backbone f0,f1,f1,f2,... so slot j spans frames
+    (j, j+1): one slot per frame. Each decode chunk hands its last frame to the
+    next so the pair spanning a chunk boundary uses the real successor.
+
+    Caches are keyed on `video_path`; frames are decoded from `media_path` if
+    given (a local copy of it). The header probe still reads `video_path`."""
     if model is None:
         with step(f"loading backbone {backbone_id}", show_progress):
             model, geometry = load_backbone(
@@ -268,13 +336,15 @@ def extract_video_tokens(
         if compile_model:
             compile_backbone(model)
 
+    if interleave_input:
+        check_interleave_supported(geometry)
+
     source_cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR) if use_cache else None
     with step("reading source metadata", show_progress) as st:
         fps_src, total_frames = decoder_timebase(video_path, cache_dir=source_cache_dir)
         st.note(f"{total_frames} frames @ {fps_src:.3f} fps ({total_frames / max(fps_src, 1e-6) / 60:.1f} min)")
 
-    start_frame = int(round((start_time or 0.0) * fps_src))
-    end_frame = total_frames if duration is None else min(total_frames, start_frame + int(round(duration * fps_src)))
+    start_frame, end_frame = _frame_window(fps_src, total_frames, start_time, duration)
     n_window_frames = max(0, end_frame - start_frame)
 
     rel_indices = np.arange(n_window_frames, dtype=np.int64)
@@ -283,7 +353,8 @@ def extract_video_tokens(
 
     window = geometry.window
     frames_per_slot = geometry.frames_per_slot
-    total_expected_slots = -(-len(idx_list) // frames_per_slot)
+    slot_stride = 1 if interleave_input else frames_per_slot
+    total_expected_slots = -(-len(idx_list) // slot_stride)
     pooling = pooling or DEFAULT_POOLING
 
     def _make_metadata() -> dict:
@@ -291,6 +362,7 @@ def extract_video_tokens(
             "backbone_id": geometry.backbone_id, "feature_fps": feature_fps,
             "frames_per_slot": frames_per_slot, "n_source_frames": int(len(rel_indices)),
             "pooling": pooling, "n_pool_tokens": pooling_num_tokens(pooling),
+            "interleave_input": bool(interleave_input), "slot_stride": slot_stride,
         }
 
     cache: ResumableTokenCache | None = None
@@ -299,11 +371,13 @@ def extract_video_tokens(
         cache_path = cache_path_for_video(
             Path(video_path), geometry, vr_mode, sbs_crop, start_frame, end_frame, cache_dir,
             crop_box=crop_box, pooling=pooling, preprocess=preprocess,
+            interleave_input=interleave_input,
         )
         cache = ResumableTokenCache(cache_path)
         cache_meta = {
             "video_path": str(Path(video_path).resolve()), "backbone_id": geometry.backbone_id,
             "feature_fps": feature_fps, "frames_per_slot": frames_per_slot,
+            "interleave_input": bool(interleave_input),
             "vr_mode": vr_mode, "sbs_crop": sbs_crop,
             "crop_box": list(crop_box) if crop_box is not None else None,
         }
@@ -321,7 +395,7 @@ def extract_video_tokens(
             print(f"  resuming token cache at slot {resume_from_slot}/{total_expected_slots} "
                   f"({100 * resume_from_slot / total_expected_slots:.1f}%)")
 
-    remaining_idx_list = idx_list[resume_from_slot * frames_per_slot:]
+    remaining_idx_list = idx_list[resume_from_slot * slot_stride:]
 
     # The preprocess cache has the SBS-eye crop, the frame-view crop and the
     # resize already baked in, so decoding it needs neither of those steps.
@@ -335,7 +409,7 @@ def extract_video_tokens(
                 Path(video_path), vr_mode, sbs_crop,
                 crop_box if crop_box is not None else CROP_BOX, geometry.resize,
                 start_frame, end_frame, fps_src, cache_dir=preprocess_dir,
-                quiet=not show_progress,
+                quiet=not show_progress, media_path=media_path,
             )
             with step("opening preprocessed clip", show_progress):
                 decoder = PreprocessedDecoder(clip_path, device, first_frame)
@@ -346,14 +420,15 @@ def extract_video_tokens(
         # seek_mode="exact" indexes the container up front -- minutes on a 25 GB
         # 8K source, and the longest unexplained pause in the whole run.
         with step("indexing source frames (exact seek)", show_progress):
-            decoder = EyeDecoder(Path(video_path), device, vr_mode, sbs_crop)
+            decoder = EyeDecoder(Path(media_path or video_path), device, vr_mode, sbs_crop)
     decode_chunk = max(1, decoder.decode_batch)
     if cache is not None:
         cache.open()
     pooled_chunks: list[np.ndarray] = []
     carry: torch.Tensor | None = None
+    pending_last: torch.Tensor | None = None  # interleave only: last frame, awaiting its successor
     progress = tqdm(
-        total=len(idx_list), initial=resume_from_slot * frames_per_slot, unit="frame",
+        total=len(idx_list), initial=resume_from_slot * slot_stride, unit="frame",
         desc="  extracting tokens", disable=not show_progress,
     )
     # Backbone windows are non-overlapping and self-contained, so splitting on
@@ -364,6 +439,15 @@ def extract_video_tokens(
         raw = decoder.frames_at(batch_idx)
         normalized = crop_resize_normalize(raw, geometry, device, crop_box=decode_crop_box)
         del raw
+
+        if interleave_input:
+            if pending_last is not None:
+                normalized = torch.cat([pending_last, normalized], dim=0)
+            pending_last = normalized[-1:].clone()
+            if normalized.shape[0] < 2:
+                progress.update(len(batch_idx))
+                continue
+            normalized = interleave_frames(normalized[:-1], next_frame=pending_last)
 
         if carry is not None:
             normalized = torch.cat([carry, normalized], dim=0)
@@ -383,6 +467,9 @@ def extract_video_tokens(
         del normalized
         progress.update(len(batch_idx))
 
+    if pending_last is not None:
+        tail = interleave_frames(pending_last)
+        carry = tail if carry is None else torch.cat([carry, tail], dim=0)
     if carry is not None and carry.shape[0] > 0:
         pooled = clip_tokens_from_frames(
             model, geometry, carry, device, batch_windows=batch_windows, pooling=pooling,

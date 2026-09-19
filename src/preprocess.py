@@ -164,11 +164,13 @@ def build(
     end_frame: int,
     fps: float,
     quiet: bool = False,
+    media_path: Path | None = None,
 ) -> tuple[Path, int]:
     """Transcode [start_frame, end_frame) to a cropped/resized clip. Returns
-    (path, first_source_frame)."""
+    (path, first_source_frame). `media_path` is read in place of `video_path`."""
+    media_path = media_path or video_path
     with step("probing source", not quiet) as st:
-        info = probe_source(video_path)
+        info = probe_source(media_path)
         st.note(f"{info['width']}x{info['height']} {info['codec']}")
     decoder = CUVID_DECODERS.get(info["codec"])
     if decoder is None or not _ffmpeg_has("decoders", decoder):
@@ -197,7 +199,7 @@ def build(
         "-ss", f"{ss:.6f}",
         "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-c:v", decoder,
         "-crop", f"{top}x{bottom}x{left}x{right}",
-        "-i", str(video_path),
+        "-i", str(media_path),
         "-an", "-sn", "-dn",
         # The clip is addressed by FRAME INDEX with a source-frame offset, so the
         # one thing that must hold is clip frame k == source frame k+offset.
@@ -257,6 +259,23 @@ def _probe_result(path: Path) -> tuple[float, int]:
     return times[0], len(times)
 
 
+def cached_clip(
+    video_path: Path,
+    vr_mode: bool,
+    sbs_crop: str,
+    crop_box: tuple[float, float, float, float],
+    resize: tuple[int, int],
+    start_frame: int,
+    end_frame: int,
+    cache_dir: Path | None = None,
+) -> tuple[Path, int] | None:
+    cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_PREPROCESS_DIR
+    if not cache_dir.is_dir():
+        return None
+    identity = _identity(Path(video_path), vr_mode, sbs_crop, crop_box, resize)
+    return find_covering(cache_dir, identity, start_frame, end_frame)
+
+
 def ensure(
     video_path: Path,
     vr_mode: bool,
@@ -268,9 +287,11 @@ def ensure(
     fps: float,
     cache_dir: Path | None = None,
     quiet: bool = False,
+    media_path: Path | None = None,
 ) -> tuple[Path, int]:
     """Reuse or build the preprocess cache for this window. Returns
-    (clip path, first_source_frame)."""
+    (clip path, first_source_frame). The cache is keyed on `video_path`; a build
+    reads `media_path` if given (a local copy of it)."""
     cache_dir = Path(cache_dir) if cache_dir is not None else DEFAULT_PREPROCESS_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
     identity = _identity(Path(video_path), vr_mode, sbs_crop, crop_box, resize)
@@ -281,4 +302,4 @@ def ensure(
         return hit
     out_path = cache_dir / f"{identity}_f{start_frame}-{end_frame}.mp4"
     return build(Path(video_path), out_path, vr_mode, sbs_crop, crop_box, resize,
-                 start_frame, end_frame, fps, quiet=quiet)
+                 start_frame, end_frame, fps, quiet=quiet, media_path=media_path)

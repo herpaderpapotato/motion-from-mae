@@ -16,6 +16,7 @@ beside it as <name>.raw.funscript; --no-simplify writes the dense track alone.
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -33,8 +34,13 @@ from src.backbone import (
     load_backbone,
     warmup_backbone,
 )
-from src.checkpoint import DEFAULT_CHECKPOINT, load_dnx_model, resolve_pooling_for_head
-from src.extract import extract_video_tokens, source_frame_times
+from src.checkpoint import (
+    DEFAULT_CHECKPOINT,
+    load_dnx_model,
+    resolve_interleave_for_head,
+    resolve_pooling_for_head,
+)
+from src.extract import extract_video_tokens, source_frame_times, source_read_needed
 from src.funscript import predictions_to_funscript
 from src.hlgauss import HLGAUSS_MODE_RADIUS
 from src.infer import (
@@ -68,6 +74,7 @@ from src.token_cache import DEFAULT_CACHE_DIR
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 FRAME_VIEWS = ("auto", "crop", "full")
+DEFAULT_LOCAL_COPY_DIR = Path("data/source_staging")
 RAW_TAG = ".raw"
 
 
@@ -125,9 +132,38 @@ def collect_videos(target: Path, exclude_dirs: tuple[Path, ...] = (),
     if not target.is_dir():
         return [target]
     excluded = [d.resolve() for d in exclude_dirs if d.is_dir()]
-    return [v for v in sorted(target.rglob("*.mp4"))
-            if (include_scripted or not v.with_suffix(".funscript").exists())
-            and not any(v.resolve().is_relative_to(d) for d in excluded)]
+    # return [v for v in sorted(target.rglob("*.mp4"))
+    #         if (include_scripted or not v.with_suffix(".funscript").exists())
+    #         and not any(v.resolve().is_relative_to(d) for d in excluded)]
+    videos = [v for v in target.rglob("*.mp4")
+              if (include_scripted or not v.with_suffix(".funscript").exists())
+              and not any(v.resolve().is_relative_to(d) for d in excluded)]
+    return sorted(videos, key=lambda v: v.stat().st_mtime, reverse=True)
+
+
+def copy_to_local(src: Path, dest_dir: Path, verbose: bool) -> Path:
+    from tqdm import tqdm
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    size = src.stat().st_size
+    free = shutil.disk_usage(dest_dir).free
+    if free < size:
+        raise OSError(f"--local-copy: {dest_dir} has {free / 1024 ** 3:.1f} GiB free, "
+                      f"{src.name} needs {size / 1024 ** 3:.1f} GiB")
+    dest = dest_dir / src.name
+    tmp = dest.with_name(dest.name + ".partial")
+    try:
+        with open(src, "rb") as fi, open(tmp, "wb") as fo, tqdm(
+                total=size, unit="B", unit_scale=True, unit_divisor=1024,
+                desc="  copying to local", disable=not verbose) as bar:
+            while chunk := fi.read(64 << 20):
+                fo.write(chunk)
+                bar.update(len(chunk))
+        tmp.replace(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return dest
 
 
 # --------------------------------------------------------------------------- #
@@ -187,8 +223,11 @@ def pick_target() -> Path | None:
 
 def process(video: Path, out: Path | None, args: argparse.Namespace, model, data_cfg: dict,
             device: torch.device, pooling, crop_box, frame_view: str, backbone_id: str,
-            model_meta: dict, backbone=None, geometry=None) -> str:
-    """Predict one video and write its funscript. Returns a one-line status."""
+            model_meta: dict, backbone=None, geometry=None,
+            media_path: Path | None = None) -> str:
+    """Predict one video and write its funscript. Returns a one-line status.
+    `media_path` is a local copy of `video` to read instead; caches and output
+    stay keyed on `video`."""
     verbose = not args.no_progress
     tokens, frame_idx, meta = extract_video_tokens(
         video, backbone_id, device, args.vr, args.sbs_crop,
@@ -200,6 +239,8 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
         backbone_img_size=data_cfg.get("backbone_img_size"),
         backbone_window=data_cfg.get("backbone_window"),
         compile_model=args.compile and backbone is None,
+        interleave_input=resolve_interleave_for_head(model, data_cfg),
+        media_path=media_path,
     )
     feature_fps = float(meta["feature_fps"])
     if verbose:
@@ -279,6 +320,7 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
             times, from_cache = source_frame_times(
                 video, min_frames=start_frame + len(position),
                 cache_dir=args.token_cache_dir if args.token_cache else None,
+                media_path=media_path,
             )
             if times is None:
                 st.note("unavailable, using the uniform fps grid")
@@ -442,7 +484,8 @@ def main() -> None:
                         help="Position track only (~1/3 the file size)")
 
     parser.add_argument("--dnx-crop-slots", type=int, default=CROP_SLOTS,
-                        help=f"Head window length in slots (default {CROP_SLOTS} = {CROP_SLOTS * 2} frames)")
+                        help=f"Head window length in slots (default {CROP_SLOTS} = {CROP_SLOTS * 2} frames, "
+                             f"or {CROP_SLOTS} frames for an interleave_input head)")
     parser.add_argument("--dnx-stride", type=int, default=None,
                         help="Head window stride in slots (default: half the window)")
     parser.add_argument("--use-raw-weights", action="store_true",
@@ -480,6 +523,13 @@ def main() -> None:
                              "runs over the same window skip decoding the full-resolution source")
     parser.add_argument("--no-preprocess", dest="preprocess", action="store_false")
     parser.add_argument("--preprocess-dir", type=Path, default=DEFAULT_PREPROCESS_DIR)
+    parser.add_argument("--local-copy", type=Path, nargs="?", const=DEFAULT_LOCAL_COPY_DIR,
+                        default=None, metavar="DIR",
+                        help="Copy the source into DIR (default %(const)s when given without "
+                             "one), read it from there, and delete the copy afterwards. Only "
+                             "when the run would read the source's frames: skipped if the "
+                             "frame times are cached and either the token cache is complete "
+                             "or (--preprocess) the clip exists")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the backbone blocks. Costs ~25s of compile once, then "
                              "measured 1.10x at 384 and 1.27x at 224 on a 3090. Needs triton "
@@ -505,7 +555,8 @@ def main() -> None:
         parser.error(f"not found: {target}")
 
     redo = args.force or args.overwrite
-    videos = collect_videos(target, exclude_dirs=(args.preprocess_dir, args.token_cache_dir),
+    videos = collect_videos(target, exclude_dirs=(args.preprocess_dir, args.token_cache_dir,
+                                                  *([args.local_copy] if args.local_copy else [])),
                             include_scripted=redo)
     if not videos:
         print(f"no {'' if redo else 'unscripted '}.mp4 under {target}")
@@ -580,15 +631,30 @@ def main() -> None:
     for i, video in enumerate(videos, 1):
         print(f"\n[{i}/{len(videos)}] {video}  ({video.stat().st_size / 1024 ** 3:.1f} GiB)", flush=True)
         t_video = time.perf_counter()
+        staged = None
         try:
+            if args.local_copy is not None:
+                if source_read_needed(
+                        video, geometry, args.vr, args.sbs_crop, args.start_time, args.duration,
+                        use_cache=args.token_cache, cache_dir=args.token_cache_dir,
+                        crop_box=crop_box, pooling=pooling, preprocess=args.preprocess,
+                        preprocess_dir=args.preprocess_dir,
+                        interleave_input=resolve_interleave_for_head(model, data_cfg),
+                        need_frame_times=args.timing == "source-pts"):
+                    staged = copy_to_local(video, args.local_copy, verbose)
+                elif verbose:
+                    print("  local copy: skipped, the run is served from caches")
             status = process(video, args.out, args, model, data_cfg, device,
                              pooling, crop_box, frame_view, backbone_id, model_meta,
-                             backbone=backbone, geometry=geometry)
+                             backbone=backbone, geometry=geometry, media_path=staged)
         except Exception as exc:  # keep going through a batch
             status = f"FAILED: {type(exc).__name__}: {exc}"
             failed += 1
         else:
             done += 1
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
         print(f"  {status}  [{human_duration(time.perf_counter() - t_video)}]", flush=True)
     print(f"\n{done} processed, {failed} failed in {human_duration(time.perf_counter() - t0)}")
 
