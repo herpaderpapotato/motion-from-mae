@@ -57,6 +57,7 @@ from src.infer import (
     confidence_axes,
     sliding_window_predict_dnx,
 )
+from src.ofsp import add_to_project
 from src.preprocess import DEFAULT_PREPROCESS_DIR
 from src.progress import human_duration, step
 from src.simplify import (
@@ -408,11 +409,85 @@ def process(video: Path, out: Path | None, args: argparse.Namespace, model, data
         status += f" from {len(position)}, raw -> {raw_path.name}"
     status += f", axes {'+'.join(a['id'] for a in funscript['axes'])})" if axes else ")"
 
+    if args.ofsp:
+        # The funscript is already on disk; a project failure shouldn't fail the video.
+        try:
+            status += ", " + add_to_project(video.with_suffix(".ofsp"), video, out_path, funscript)
+        except Exception as exc:
+            status += f", ofsp FAILED: {type(exc).__name__}: {exc}"
+
     if args.save_activity:
         act_path = out_path.with_suffix(".activity.npy")
         np.save(act_path, activity)
         status += f", activity -> {act_path.name}"
     return status
+
+
+_DLL_DIR_HANDLES = []
+
+
+def _has_ffmpeg_dlls(d: Path) -> bool:
+    try:
+        return d.is_dir() and any(d.glob("avutil-*.dll"))
+    except OSError:
+        return False
+
+
+def _find_shared_ffmpeg_bin() -> Path | None:
+    candidates = []
+    if os.environ.get("FFMPEG_DIR"):
+        root = Path(os.environ["FFMPEG_DIR"])
+        candidates += [root / "bin", root]
+    on_path = shutil.which("ffmpeg")
+    if on_path:
+        candidates.append(Path(on_path).parent)
+    candidates += [Path(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        winget = Path(local) / "Microsoft" / "WinGet" / "Packages"
+        candidates += sorted(winget.glob("BtbN.FFmpeg.GPL.Shared.*_*/ffmpeg-*/bin"), reverse=True)
+    return next((d for d in candidates if _has_ffmpeg_dlls(d)), None)
+
+
+def ensure_windows_ffmpeg() -> None:
+    """WINDOWS.MD steps 1+3: shared FFmpeg DLLs in the env's Library\\bin, ffprobe on PATH.
+
+    Falls back to a shared build found elsewhere (FFMPEG_DIR, PATH, winget) by
+    registering it for DLL loading and prepending it to PATH for this process.
+    Must run before anything imports torchcodec.
+    """
+    if sys.platform != "win32":
+        return
+    env_bins = [Path(sys.prefix) / "Library" / "bin"]
+    if os.environ.get("CONDA_PREFIX"):
+        env_bins.append(Path(os.environ["CONDA_PREFIX"]) / "Library" / "bin")
+    dlls_ok = any(_has_ffmpeg_dlls(d) for d in env_bins)
+    probe_ok = shutil.which("ffprobe") is not None
+    if dlls_ok and probe_ok:
+        return
+
+    src = _find_shared_ffmpeg_bin()
+    if src is None:
+        static = shutil.which("ffmpeg")
+        if not dlls_ok:
+            hint = f"; {static} has no avutil-*.dll beside it (static build?)" if static else ""
+            print(f"[warn] no shared FFmpeg build found{hint}. torchcodec will fail to load: "
+                  f"see WINDOWS.MD steps 1 and 3, or set FFMPEG_DIR to a gpl-shared build")
+        else:
+            print("[warn] ffprobe not on PATH: frame rate falls back to the container average, "
+                  "which drifts on long files (WINDOWS.MD step 3)")
+        return
+
+    # torch/torchcodec load with LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, which ignores PATH,
+    # so the DLL directory has to be registered explicitly; PATH covers ffmpeg/ffprobe.
+    if not dlls_ok:
+        _DLL_DIR_HANDLES.append(os.add_dll_directory(str(src)))
+    os.environ["PATH"] = str(src) + os.pathsep + os.environ.get("PATH", "")
+    missing = [what for what, ok in (("FFmpeg DLLs", dlls_ok), ("ffprobe", probe_ok)) if not ok]
+    print(f"[warn] {' and '.join(missing)} not in the environment; using {src} for this run.")
+    if os.environ.get("CONDA_PREFIX"):
+        print(f"  To make it permanent (WINDOWS.MD step 3):\n"
+              f"    Copy-Item \"{src}\\*\" \"{env_bins[-1]}\"")
 
 
 def main() -> None:
@@ -475,6 +550,11 @@ def main() -> None:
                         help="Min-max rescale the predicted track to span 0-100 before it is "
                              "written and simplified (applies to the .raw sidecar too)")
     parser.add_argument("--save-activity", action="store_true", help="Write a sidecar .activity.npy")
+    parser.add_argument("--ofsp", dest="ofsp", action="store_true", default=True,
+                        help="Add the written funscript as a track to <video>.ofsp (OpenFunscripter "
+                             "project, which OFS opens in place of the video). An existing project "
+                             "is backed up to <video>.ofsp.<timestamp>.backup first")
+    parser.add_argument("--no-ofsp", dest="ofsp", action="store_false")
     parser.add_argument("--confidence-axes", dest="confidence_axes", action="store_true", default=False,
                         help="Write confidence as extra funscript axes C1 (speed-corrected "
                              "sharpness), C2 "
@@ -541,6 +621,7 @@ def main() -> None:
                         help="Quiet: no progress bars or per-phase status lines, one line per video")
 
     args = parser.parse_args()
+    ensure_windows_ffmpeg()
     if args.offline:
         from src.hub import set_offline
 
