@@ -6,3 +6,4 @@ h5py
 tqdm
 safetensors
 huggingface_hub
+triton-windows
